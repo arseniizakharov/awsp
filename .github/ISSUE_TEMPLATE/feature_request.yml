@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest a focused awsp improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is hard or unsafe today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and shell impact
+      description: Note any impact on credentials, SSO cache handling, shell output, or rc-file behavior.

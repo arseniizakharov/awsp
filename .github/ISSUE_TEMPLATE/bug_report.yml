@@ -1,0 +1,40 @@
+name: Bug report
+description: Report reproducible awsp behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste real AWS credentials, SSO cache files, unredacted account IDs, SSO start URLs, or token-bearing logs.
+  - type: input
+    id: version
+    attributes:
+      label: awsp version
+      placeholder: awsp 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include redacted AWS config snippets if needed.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Output from awsp doctor/current/status, with sensitive values redacted.
+      render: text
