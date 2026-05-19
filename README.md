@@ -86,11 +86,10 @@ source ~/.config/awsp/shell/awsp.sh
 The intended Homebrew formula should declare:
 
 ```ruby
-depends_on "awscli"
 depends_on "fzf"
 ```
 
-`fzf` is mandatory for interactive profile selection. Explicit profile commands such as `awsp use prod-admin` do not need `fzf`.
+`fzf` is mandatory for interactive profile selection. AWS CLI is a runtime requirement only for commands that shell out to `aws`, such as SSO login, logout, `whoami`, and `status --verify`. `awsp doctor` reports whether `aws` is available and prints an install hint when it is missing.
 
 ## Homebrew Beta
 
@@ -104,7 +103,7 @@ Once the tap repo contains `Formula/awsp-beta.rb`, install from another machine 
 brew install nomadsre/awsp/awsp-beta
 ```
 
-On Apple Silicon macOS, Homebrew installs a prebuilt `awsp` binary plus runtime dependencies. It does not modify `~/.zshrc`, `~/.bashrc`, or other shell startup files. Run `awsp setup zsh` or `awsp setup bash` once after install to add the shell hook.
+On Apple Silicon macOS, Homebrew installs a prebuilt `awsp` binary plus `fzf`. It does not install AWS CLI and does not modify `~/.zshrc`, `~/.bashrc`, or other shell startup files. Run `awsp setup zsh` or `awsp setup bash` once after install to add the shell hook.
 
 ## Security
 

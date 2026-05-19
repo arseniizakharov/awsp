@@ -489,10 +489,12 @@ fn status(profile_name: Option<String>, verify: bool) -> Result<()> {
 
 fn doctor() -> Result<()> {
     println!("awsp doctor");
-    println!(
-        "aws cli: {}",
-        if aws::is_available() { "ok" } else { "missing" }
-    );
+    if aws::is_available() {
+        println!("aws cli: ok");
+    } else {
+        println!("aws cli: missing");
+        println!("  {}", aws::missing_cli_message().replace('\n', "\n  "));
+    }
     println!(
         "fzf: {}",
         if fzf::is_available() { "ok" } else { "missing" }

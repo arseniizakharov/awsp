@@ -2,6 +2,15 @@ use anyhow::{bail, Context, Result};
 use std::fs::OpenOptions;
 use std::process::{Command, Stdio};
 
+const AWS_CLI_MISSING_MESSAGE: &str = "\
+AWS CLI is required for this command, but `aws` was not found in PATH.
+
+Install AWS CLI v2, for example:
+  brew install awscli
+
+If AWS CLI is already installed, make sure `aws` is available in PATH and run:
+  awsp doctor";
+
 pub fn is_available() -> bool {
     Command::new("aws")
         .arg("--version")
@@ -12,6 +21,18 @@ pub fn is_available() -> bool {
         .unwrap_or(false)
 }
 
+pub fn missing_cli_message() -> &'static str {
+    AWS_CLI_MISSING_MESSAGE
+}
+
+fn ensure_available() -> Result<()> {
+    if is_available() {
+        return Ok(());
+    }
+
+    bail!("{AWS_CLI_MISSING_MESSAGE}");
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AwsOutput {
     Inherit,
@@ -19,6 +40,8 @@ pub enum AwsOutput {
 }
 
 pub fn login_profile(profile: &str, output: AwsOutput) -> Result<()> {
+    ensure_available()?;
+
     let status = Command::new("aws")
         .args(["sso", "login", "--profile", profile])
         .env("AWS_PAGER", "")
@@ -53,6 +76,8 @@ fn user_stdout(output: AwsOutput) -> Stdio {
 }
 
 pub fn login_session(session: &str) -> Result<()> {
+    ensure_available()?;
+
     let status = Command::new("aws")
         .args(["sso", "login", "--sso-session", session])
         .env("AWS_PAGER", "")
@@ -70,6 +95,8 @@ pub fn login_session(session: &str) -> Result<()> {
 }
 
 pub fn logout() -> Result<()> {
+    ensure_available()?;
+
     let status = Command::new("aws")
         .args(["sso", "logout"])
         .env("AWS_PAGER", "")
@@ -87,6 +114,8 @@ pub fn logout() -> Result<()> {
 }
 
 pub fn whoami(profile: Option<&str>) -> Result<()> {
+    ensure_available()?;
+
     let mut command = Command::new("aws");
     command
         .args(["sts", "get-caller-identity", "--no-cli-pager"])
@@ -111,6 +140,8 @@ pub fn whoami(profile: Option<&str>) -> Result<()> {
 }
 
 pub fn verify(profile: &str) -> Result<String> {
+    ensure_available()?;
+
     let output = Command::new("aws")
         .args([
             "sts",
@@ -131,4 +162,17 @@ pub fn verify(profile: &str) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_cli_message_names_dependency_and_fix() {
+        let message = missing_cli_message();
+        assert!(message.contains("AWS CLI is required"));
+        assert!(message.contains("brew install awscli"));
+        assert!(message.contains("awsp doctor"));
+    }
 }
