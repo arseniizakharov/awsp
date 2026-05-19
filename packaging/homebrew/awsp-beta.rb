@@ -3,8 +3,8 @@
 class AwspBeta < Formula
   desc "Switch AWS SSO profiles across shell sessions"
   homepage "https://github.com/nomadsre/awsp"
-  url "https://github.com/nomadsre/awsp/archive/refs/tags/v0.1.0-beta.1.tar.gz"
-  sha256 "c8d17516606759f642fdabc9b4b922e6c71b58ada0f91e702c42099129c89a63"
+  url "https://github.com/nomadsre/awsp/archive/refs/tags/v0.1.0-beta.2.tar.gz"
+  sha256 "e3db6f23a3821321456dcfb17945c6f36eedaf6cb0971a1b9b2b76f1e3f1d36b"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/nomadsre/awsp.git", branch: "main"
 
