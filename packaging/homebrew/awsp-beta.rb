@@ -3,17 +3,37 @@
 class AwspBeta < Formula
   desc "Switch AWS SSO profiles across shell sessions"
   homepage "https://github.com/nomadsre/awsp"
-  url "https://github.com/nomadsre/awsp/archive/refs/tags/v0.1.0-beta.6.tar.gz"
-  sha256 "51a14ca9477db27c87c8e5aa24e525763d28ce0b8f9765e708e0b2d279e93761"
   license any_of: ["MIT", "Apache-2.0"]
-  head "https://github.com/nomadsre/awsp.git", branch: "main"
+  version "0.1.0-beta.6"
 
-  depends_on "rust" => :build
+  on_macos do
+    on_arm do
+      url "https://github.com/nomadsre/awsp/releases/download/v0.1.0-beta.6/awsp-v0.1.0-beta.6-aarch64-apple-darwin.tar.gz"
+      sha256 "0985d0610ff6ede51a6362eea8a941f44c67da6a0a21f6c74c67fb3ab59fe7c5"
+    end
+
+    on_intel do
+      url "https://github.com/nomadsre/awsp/archive/refs/tags/v0.1.0-beta.6.tar.gz"
+      sha256 "51a14ca9477db27c87c8e5aa24e525763d28ce0b8f9765e708e0b2d279e93761"
+      depends_on "rust" => :build
+    end
+  end
+
+  on_linux do
+    url "https://github.com/nomadsre/awsp/archive/refs/tags/v0.1.0-beta.6.tar.gz"
+    sha256 "51a14ca9477db27c87c8e5aa24e525763d28ce0b8f9765e708e0b2d279e93761"
+    depends_on "rust" => :build
+  end
+
   depends_on "awscli"
   depends_on "fzf"
 
   def install
-    system "cargo", "install", *std_cargo_args(path: ".")
+    if (buildpath/"Cargo.toml").exist?
+      system "cargo", "install", *std_cargo_args(path: ".")
+    else
+      bin.install "awsp"
+    end
   end
 
   def caveats

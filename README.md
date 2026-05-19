@@ -104,13 +104,7 @@ Once the tap repo contains `Formula/awsp-beta.rb`, install from another machine 
 brew install nomadsre/awsp/awsp-beta
 ```
 
-Homebrew installs the binary and dependencies only. It does not modify `~/.zshrc`, `~/.bashrc`, or other shell startup files. Run `awsp setup zsh` or `awsp setup bash` once after install to add the shell hook.
-
-For latest `main` from the tap:
-
-```sh
-brew install --HEAD nomadsre/awsp/awsp-beta
-```
+On Apple Silicon macOS, Homebrew installs a prebuilt `awsp` binary plus runtime dependencies. It does not modify `~/.zshrc`, `~/.bashrc`, or other shell startup files. Run `awsp setup zsh` or `awsp setup bash` once after install to add the shell hook.
 
 ## Security
 
