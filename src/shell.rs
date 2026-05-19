@@ -95,7 +95,7 @@ pub fn off_code(session_id: Option<&str>) -> String {
     lines.join("\n")
 }
 
-fn quote(value: &str) -> String {
+pub fn quote(value: &str) -> String {
     let escaped = value.replace('\'', r#"'\''"#);
     format!("'{escaped}'")
 }

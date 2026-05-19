@@ -38,6 +38,18 @@ awsp setup bash
 
 After integration is active, `awsp`, `awsp use`, `awsp activate`, `awsp off`, `awsp clear`, and `awsp restore` can update the current shell by evaluating shell-safe code emitted by the hidden `awsp __shell` command. Successful switches print a short confirmation to stderr.
 
+If `awsp` resolves to the binary instead of the shell function, activation commands stop before opening the picker because a child process cannot export `AWS_PROFILE` into its parent shell. Check with:
+
+```sh
+type awsp
+```
+
+Expected output should say that `awsp` is a shell function. If it points at the Homebrew binary, restart the shell or run:
+
+```sh
+source "$HOME/.config/awsp/shell/awsp.sh"
+```
+
 Activation exports:
 
 ```sh

@@ -139,6 +139,7 @@ fn run() -> Result<()> {
     match cli.command {
         None => {
             onboarding::maybe_install_for_plain_entrypoint()?;
+            require_shell_function_for_activation("awsp")?;
             activate_profile(None, OutputMode::Human)
         }
         Some(Command::Init { shell }) => {
@@ -162,10 +163,16 @@ fn run() -> Result<()> {
             OutputMode::Human
         }),
         Some(Command::List) => list_profiles(),
-        Some(Command::Use { profile }) => activate_profile(profile, OutputMode::Human),
+        Some(Command::Use { profile }) => {
+            require_shell_function_for_activation("awsp use")?;
+            activate_profile(profile, OutputMode::Human)
+        }
         Some(Command::Login { profile }) => login_profile(profile),
         Some(Command::LoginSession { session }) => login_session(&session),
-        Some(Command::Off) => turn_off(OutputMode::Human),
+        Some(Command::Off) => {
+            require_shell_function_for_activation("awsp off")?;
+            turn_off(OutputMode::Human)
+        }
         Some(Command::Exec { profile, command }) => exec_profile(&profile, command),
         Some(Command::Logout { all }) => logout(all),
         Some(Command::Current) => current(),
@@ -241,8 +248,9 @@ fn setup_shell(shell: Option<ShellKind>) -> Result<()> {
     }
     eprintln!(
         "To enable it in the current shell, run: source {}",
-        script_path.display()
+        shell::quote(&script_path.display().to_string())
     );
+    eprintln!("Until then, `awsp` resolves to the binary and cannot export AWS_PROFILE.");
     Ok(())
 }
 
@@ -367,10 +375,46 @@ fn turn_off(mode: OutputMode) -> Result<()> {
     Ok(())
 }
 
+fn require_shell_function_for_activation(command: &str) -> Result<()> {
+    let script_path = onboarding::integration_script_path().ok();
+    let script_command = script_path
+        .as_ref()
+        .map(|path| format!("source {}", shell::quote(&path.display().to_string())))
+        .unwrap_or_else(|| "source ~/.config/awsp/shell/awsp.sh".to_string());
+
+    if matches!(
+        onboarding::integration_is_installed_for_current_shell(),
+        Ok(true)
+    ) {
+        bail!(
+            "shell integration is installed, but this terminal has not loaded the awsp function.\n\
+             `{command}` must run through the shell function so it can export AWS_PROFILE in your current shell.\n\n\
+             Run:\n  {script_command}\n\n\
+             Then verify:\n  type awsp\n\n\
+             Expected: awsp is a shell function"
+        );
+    }
+
+    let setup_command = shell::detect_shell()
+        .map(|shell| format!("awsp setup {}", shell.as_str()))
+        .unwrap_or_else(|| "awsp setup zsh".to_string());
+
+    bail!(
+        "shell integration is not active.\n\
+         `{command}` must run through the awsp shell function so it can export AWS_PROFILE in your current shell.\n\n\
+         Run:\n  {setup_command}\n  {script_command}\n\n\
+         Then verify:\n  type awsp\n\n\
+         Expected: awsp is a shell function"
+    );
+}
+
 fn print_inactive_shell_integration_guidance() {
     match onboarding::integration_is_installed_for_current_shell() {
         Ok(true) => match onboarding::integration_script_path() {
-            Ok(path) => eprintln!("Restart the shell or run: source {}", path.display()),
+            Ok(path) => eprintln!(
+                "Restart the shell or run: source {}",
+                shell::quote(&path.display().to_string())
+            ),
             Err(_) => eprintln!("Restart the shell or source the awsp shell integration."),
         },
         _ => eprintln!("Run awsp setup zsh or awsp setup bash once, then restart the shell."),
