@@ -32,14 +32,8 @@ pub fn init_script(shell: ShellKind) -> String {
     format!(
         r#"# awsp shell integration for {shell_name}
 if [ -z "${{AWSP_SESSION_ID:-}}" ]; then
-  export AWSP_SESSION_ID="$(command awsp new-session-id)"
+  export AWSP_SESSION_ID="awsp-$$-${{RANDOM:-0}}-${{RANDOM:-0}}"
 fi
-
-__awsp_restore="$(command awsp __shell restore 2>/dev/null)"
-if [ $? -eq 0 ] && [ -n "$__awsp_restore" ]; then
-  eval "$__awsp_restore"
-fi
-unset __awsp_restore
 
 awsp() {{
   case "${{1-}}" in
@@ -122,5 +116,13 @@ mod tests {
         assert!(code.contains("export AWS_PROFILE='prod'"));
         assert!(code.contains("export AWS_SDK_LOAD_CONFIG='1'"));
         assert!(code.contains("unset AWS_ACCESS_KEY_ID"));
+    }
+
+    #[test]
+    fn init_script_does_not_run_awsp_during_shell_startup() {
+        let script = init_script(ShellKind::Zsh);
+        assert!(!script.contains("awsp init"));
+        assert!(!script.contains("new-session-id"));
+        assert!(!script.contains("__shell restore"));
     }
 }

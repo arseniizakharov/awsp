@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
     name = "awsp",
     version,
     about = "Switch AWS SSO profiles across shell sessions.",
-    after_help = "Quick start:\n  awsp                         Pick an SSO profile and activate it\n  awsp status                  Show local SSO cache status\n  awsp profiles                List complete SSO profiles\n  eval \"$(awsp init zsh)\"      Enable shell switching"
+    after_help = "Quick start:\n  awsp                         Pick an SSO profile and activate it\n  awsp setup zsh               Install shell integration once\n  awsp status                  Show local SSO cache status\n  awsp profiles                List complete SSO profiles"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,6 +33,11 @@ enum Command {
     /// Print zsh/bash shell integration.
     Init {
         /// Shell to initialize. Autodetects from SHELL when omitted.
+        shell: Option<ShellKind>,
+    },
+    /// Install static zsh/bash shell integration.
+    Setup {
+        /// Shell to set up. Autodetects from SHELL when omitted.
         shell: Option<ShellKind>,
     },
     /// Generate a new awsp shell-session id.
@@ -146,6 +151,7 @@ fn run() -> Result<()> {
             print!("{}", shell::init_script(shell));
             Ok(())
         }
+        Some(Command::Setup { shell }) => setup_shell(shell),
         Some(Command::NewSessionId) => {
             println!("{}", state::new_session_id());
             Ok(())
@@ -213,10 +219,26 @@ fn activate_profile(profile_name: Option<String>, mode: OutputMode) -> Result<()
             eprintln!(
                 "Shell integration is not active in this process, so AWS_PROFILE was not exported here."
             );
-            eprintln!("Run eval \"$(awsp init zsh)\" or eval \"$(awsp init bash)\" in this shell, or restart after installing the rc hook.");
+            eprintln!("Run awsp setup zsh or awsp setup bash once, then restart the shell.");
         }
     }
 
+    Ok(())
+}
+
+fn setup_shell(shell: Option<ShellKind>) -> Result<()> {
+    let shell = shell
+        .or_else(shell::detect_shell)
+        .context("could not autodetect shell; pass zsh or bash")?;
+    onboarding::install_shell_integration(shell)?;
+    let script_path = onboarding::integration_script_path()?;
+
+    println!("Installed awsp shell integration for {}.", shell.as_str());
+    println!("New shells will source {}.", script_path.display());
+    println!(
+        "To enable it in the current shell, run: source {}",
+        script_path.display()
+    );
     Ok(())
 }
 

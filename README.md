@@ -25,14 +25,16 @@ The tool stores only non-secret local state in `~/.config/awsp/state.json`. AWS 
 For zsh:
 
 ```sh
-eval "$(awsp init zsh)"
+awsp setup zsh
 ```
 
 For bash:
 
 ```sh
-eval "$(awsp init bash)"
+awsp setup bash
 ```
+
+`awsp setup` is a one-time install step. It writes the static shell integration to `~/.config/awsp/shell/awsp.sh` and adds a small source block to `~/.zshrc` or `~/.bashrc`. New terminal tabs do not run `awsp init`.
 
 After integration is active, `awsp`, `awsp use`, `awsp activate`, `awsp off`, `awsp clear`, and `awsp restore` can update the current shell by evaluating shell-safe code emitted by the hidden `awsp __shell` command. Successful switches print a short confirmation to stderr.
 
@@ -51,15 +53,21 @@ Region variables are not exported. Regions shown in the picker come from the pro
 
 ## First run
 
-Running plain `awsp` without shell integration prompts to install an rc-file hook into `~/.zshrc` or `~/.bashrc`. The command can append:
+Running plain `awsp` without shell integration prompts to install an rc-file hook into `~/.zshrc` or `~/.bashrc`. The command writes `~/.config/awsp/shell/awsp.sh` and can append:
 
 ```sh
-# >>> awsp init >>>
-eval "$(awsp init zsh)"
-# <<< awsp init <<<
+# >>> awsp shell integration >>>
+if [ -r "$HOME/.config/awsp/shell/awsp.sh" ]; then
+  . "$HOME/.config/awsp/shell/awsp.sh"
+fi
+# <<< awsp shell integration <<<
 ```
 
-A child process cannot mutate the parent shell, so the current shell must be restarted or sourced after installing the hook.
+A child process cannot mutate the parent shell, so the current shell must be restarted after installing the hook. To enable it immediately in the current shell:
+
+```sh
+source ~/.config/awsp/shell/awsp.sh
+```
 
 ## Dependencies
 
