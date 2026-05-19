@@ -7,10 +7,10 @@ class AwspBeta < Formula
   sha256 "0985d0610ff6ede51a6362eea8a941f44c67da6a0a21f6c74c67fb3ab59fe7c5"
   license any_of: ["MIT", "Apache-2.0"]
 
-  depends_on :macos
-  depends_on arch: :arm64
   depends_on "awscli"
   depends_on "fzf"
+  depends_on arch: :arm64
+  depends_on :macos
 
   def install
     bin.install "awsp"
