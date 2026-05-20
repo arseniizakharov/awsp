@@ -7,6 +7,9 @@ The tool stores only non-secret local state in `~/.config/awsp/state.json`. AWS 
 ## MVP behavior
 
 - `awsp` opens a built-in terminal picker for complete AWS SSO profiles.
+- `awsp --table` opens the compact table picker.
+- `awsp <fragment>` switches when a fragment is unique, disambiguates when it is not, and suggests near profile names on typos.
+- `awsp --emit-env <fragment>` prints shell-safe exports for shell-function integration.
 - `awsp use <profile>` activates an exact profile name. `awsp activate <profile>` is an alias.
 - `awsp login <profile>` runs `aws sso login --profile <profile>`.
 - `awsp login-session <session>` runs `aws sso login --sso-session <session>`.
@@ -14,6 +17,7 @@ The tool stores only non-secret local state in `~/.config/awsp/state.json`. AWS 
 - `awsp exec <profile> -- <command>` runs one command with that profile.
 - `awsp logout --all` runs `aws sso logout` and clears local awsp state.
 - `awsp status` reads AWS CLI SSO cache files under `~/.aws/sso/cache` without network calls.
+- `awsp status --json` prints the active profile status as a single JSON object.
 - `awsp status --verify <profile>` calls `aws sts get-caller-identity`.
 - `awsp current` reports local env/state only.
 - `awsp whoami` calls AWS STS for the active profile.
@@ -36,7 +40,7 @@ awsp setup bash
 
 `awsp setup` is a one-time install step. It writes the static shell integration to `~/.config/awsp/shell/awsp.sh` and adds a small source block to shell startup files. For zsh this is `~/.zshrc` and `~/.zprofile`; if `ZDOTDIR` is exported or set in a simple `~/.zshenv`, setup also updates `$ZDOTDIR/.zshrc` and `$ZDOTDIR/.zprofile`. For bash this is `~/.bashrc` plus the first existing login file among `~/.bash_profile`, `~/.bash_login`, and `~/.profile`; if none exists, `~/.bash_profile` is created. New terminal tabs do not run `awsp init`.
 
-After integration is active, `awsp`, `awsp use`, `awsp activate`, `awsp off`, `awsp clear`, and `awsp restore` can update the current shell by evaluating shell-safe code emitted by the hidden `awsp __shell` command. Successful switches print a short confirmation to stderr.
+After integration is active, `awsp`, `awsp --table`, direct fragments like `awsp prod-readonly`, `awsp use`, `awsp activate`, `awsp off`, `awsp clear`, and `awsp restore` can update the current shell by evaluating shell-safe code emitted by the hidden `awsp __shell` command. Successful switches print a short confirmation to stderr.
 
 If `awsp` resolves to the binary instead of the shell function, activation commands stop before opening the picker because a child process cannot export `AWS_PROFILE` into its parent shell. Check with:
 
@@ -58,10 +62,11 @@ unset AWS_SECRET_ACCESS_KEY
 unset AWS_SESSION_TOKEN
 unset AWS_SESSION_EXPIRATION
 export AWS_PROFILE='<profile>'
+export AWS_REGION='<profile-region>'
 export AWS_SDK_LOAD_CONFIG='1'
 ```
 
-Region variables are not exported. Regions shown in the picker come from the profile `region`, then `[default]` `region`, then `unset`. A trailing `*` means the region was inherited from `[default]`.
+Regions shown in the picker come from the profile `region`, then `[default]` `region`, then `unset`. A trailing `*` means the region was inherited from `[default]`. `AWSP_PROD=1` is exported only when the active profile name contains `prod`; otherwise it is unset.
 
 ## First run
 

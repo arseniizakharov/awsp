@@ -13,6 +13,12 @@ pub enum LoginStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheStatus {
+    pub state: LoginStatus,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 impl fmt::Display for LoginStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -23,16 +29,16 @@ impl fmt::Display for LoginStatus {
     }
 }
 
-pub fn status_for_profile(profile: &SsoProfile) -> LoginStatus {
-    status_for_profile_in_dir(profile, &cache_dir())
+pub fn cache_status_for_profile(profile: &SsoProfile) -> CacheStatus {
+    cache_status_for_profile_in_dir(profile, &cache_dir())
 }
 
-fn status_for_profile_in_dir(profile: &SsoProfile, dir: &Path) -> LoginStatus {
+fn cache_status_for_profile_in_dir(profile: &SsoProfile, dir: &Path) -> CacheStatus {
     let Ok(entries) = fs::read_dir(dir) else {
-        return LoginStatus::Unknown;
+        return CacheStatus::unknown();
     };
 
-    let mut saw_expired = false;
+    let mut latest_expired = None;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -61,16 +67,50 @@ fn status_for_profile_in_dir(profile: &SsoProfile, dir: &Path) -> LoginStatus {
         };
 
         if expiry > Utc::now() {
-            return LoginStatus::Valid;
+            return CacheStatus {
+                state: LoginStatus::Valid,
+                expires_at: Some(expiry),
+            };
         }
 
-        saw_expired = true;
+        latest_expired = latest_expired.max(Some(expiry));
     }
 
-    if saw_expired {
-        LoginStatus::Expired
+    if let Some(expires_at) = latest_expired {
+        CacheStatus {
+            state: LoginStatus::Expired,
+            expires_at: Some(expires_at),
+        }
     } else {
-        LoginStatus::Unknown
+        CacheStatus::unknown()
+    }
+}
+
+impl CacheStatus {
+    pub fn unknown() -> Self {
+        Self {
+            state: LoginStatus::Unknown,
+            expires_at: None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match (self.state, self.expires_at) {
+            (LoginStatus::Valid, Some(expires_at)) => {
+                format!("valid {}", duration_until(expires_at))
+            }
+            (LoginStatus::Valid, None) => "valid".to_string(),
+            (LoginStatus::Expired, Some(expires_at)) => {
+                format!("expired ({})", duration_since(expires_at))
+            }
+            (LoginStatus::Expired, None) => "expired".to_string(),
+            (LoginStatus::Unknown, _) => "unknown".to_string(),
+        }
+    }
+
+    pub fn expires_in_seconds(&self) -> Option<i64> {
+        self.expires_at
+            .map(|expires_at| (expires_at - Utc::now()).num_seconds())
     }
 }
 
@@ -102,6 +142,31 @@ fn parse_aws_expiry(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&normalized)
         .map(|datetime| datetime.with_timezone(&Utc))
         .ok()
+}
+
+fn duration_until(expires_at: DateTime<Utc>) -> String {
+    let seconds = (expires_at - Utc::now()).num_seconds().max(0);
+    compact_duration(seconds)
+}
+
+fn duration_since(expires_at: DateTime<Utc>) -> String {
+    let seconds = (Utc::now() - expires_at).num_seconds().max(0);
+    compact_duration(seconds)
+}
+
+fn compact_duration(seconds: i64) -> String {
+    let minutes = (seconds / 60).max(0);
+    let days = minutes / (60 * 24);
+    if days > 0 {
+        return format!("{days}d ago");
+    }
+
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours > 0 {
+        return format!("{hours}h {remaining_minutes}m");
+    }
+    format!("{remaining_minutes}m")
 }
 
 fn cache_dir() -> PathBuf {
@@ -147,7 +212,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            status_for_profile_in_dir(&profile(), tempdir.path()),
+            cache_status_for_profile_in_dir(&profile(), tempdir.path()).state,
             LoginStatus::Valid
         );
     }
@@ -166,8 +231,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            status_for_profile_in_dir(&profile(), tempdir.path()),
+            cache_status_for_profile_in_dir(&profile(), tempdir.path()).state,
             LoginStatus::Expired
         );
+    }
+
+    #[test]
+    fn labels_unknown_cache_status() {
+        assert_eq!(CacheStatus::unknown().label(), "unknown");
     }
 }

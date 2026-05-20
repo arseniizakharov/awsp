@@ -5,11 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
-pub struct AwsConfig {
-    pub path: PathBuf,
-    pub profiles: Vec<SsoProfile>,
-    pub sso_sessions: BTreeMap<String, SsoSession>,
-    pub diagnostics: Vec<ConfigDiagnostic>,
+pub struct SsoInventory {
+    path: PathBuf,
+    profiles: Vec<SsoProfile>,
+    sso_sessions: BTreeMap<String, SsoSession>,
+    diagnostics: Vec<ConfigDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,11 +50,18 @@ impl RegionDisplay {
             Self::Unset => "unset".to_string(),
         }
     }
+
+    pub fn export_value(&self) -> Option<&str> {
+        match self {
+            Self::Profile(region) | Self::Default(region) => Some(region.as_str()),
+            Self::Unset => None,
+        }
+    }
 }
 
 type Section = BTreeMap<String, String>;
 
-impl AwsConfig {
+impl SsoInventory {
     pub fn load_from_env() -> Result<Self> {
         let path = config_path()?;
         Self::load(path)
@@ -80,6 +87,52 @@ impl AwsConfig {
         self.sso_sessions
             .get(name)
             .with_context(|| format!("no sso-session named {name}"))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn profiles(&self) -> &[SsoProfile] {
+        &self.profiles
+    }
+
+    pub fn default_profile_name(&self) -> Option<&str> {
+        self.find_profile("default")
+            .map(|profile| profile.name.as_str())
+    }
+
+    pub fn diagnostics(&self) -> &[ConfigDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn sso_session_count(&self) -> usize {
+        self.sso_sessions.len()
+    }
+
+    pub fn modern_profile_count(&self) -> usize {
+        self.profiles
+            .iter()
+            .filter(|profile| profile.sso_session.is_some())
+            .count()
+    }
+
+    pub fn account_count(&self) -> usize {
+        self.profiles
+            .iter()
+            .map(|profile| profile.account_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    #[cfg(test)]
+    pub fn from_parts_for_test(path: PathBuf, profiles: Vec<SsoProfile>) -> Self {
+        Self {
+            path,
+            profiles,
+            sso_sessions: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        }
     }
 
     fn from_sections(path: PathBuf, sections: BTreeMap<String, Section>) -> Self {
@@ -146,7 +199,13 @@ impl AwsConfig {
             }
         }
 
-        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+        profiles.sort_by(|left, right| {
+            left.sso_session
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right.sso_session.as_deref().unwrap_or(""))
+                .then_with(|| left.name.cmp(&right.name))
+        });
 
         Self {
             path,
@@ -405,7 +464,7 @@ mod tests {
             "#,
         );
 
-        let config = AwsConfig::from_sections(PathBuf::from("/tmp/config"), sections);
+        let config = SsoInventory::from_sections(PathBuf::from("/tmp/config"), sections);
         assert_eq!(config.profiles.len(), 2);
         assert_eq!(config.profiles[0].name, "legacy");
         assert_eq!(
@@ -429,7 +488,7 @@ mod tests {
             "#,
         );
 
-        let config = AwsConfig::from_sections(PathBuf::from("/tmp/config"), sections);
+        let config = SsoInventory::from_sections(PathBuf::from("/tmp/config"), sections);
         assert!(config.profiles.is_empty());
         assert_eq!(config.diagnostics.len(), 1);
     }

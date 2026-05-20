@@ -1,6 +1,7 @@
 use crate::aws_config::SsoProfile;
-use crate::cache::LoginStatus;
+use crate::cache::CacheStatus;
 use crate::palette;
+use crate::picker_model::{PickerCommand, PickerEntry, PickerMode, PickerModel, PickerOutcome};
 use anyhow::{bail, Context, Result};
 use crossterm::cursor::{Hide, MoveToColumn, MoveUp, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -9,25 +10,23 @@ use crossterm::style::{
 };
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
-use std::cmp;
 use std::io::{self, Stderr, Write};
 
-const MAX_VISIBLE_ROWS: usize = 8;
-const NAME_WIDTH: usize = 30;
-
-#[derive(Debug, Clone)]
-struct PickerEntry<'a> {
-    profile: &'a SsoProfile,
-    status: LoginStatus,
-    env: &'static str,
-    is_current: bool,
-    search_text: String,
-}
+const NAME_WIDTH: usize = 24;
+const ACCOUNT_WIDTH: usize = 15;
+const REGION_WIDTH: usize = 18;
+const TABLE_RULE_WIDTH: usize = 76;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PickerMode {
-    Normal,
-    Filter,
+pub enum PickerView {
+    Numbered,
+    Table,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerSelection {
+    Profile(String),
+    Relogin(String),
 }
 
 struct TerminalGuard;
@@ -49,217 +48,87 @@ impl Drop for TerminalGuard {
 
 pub fn select_profile(
     profiles: &[SsoProfile],
-    statuses: &[LoginStatus],
+    statuses: &[CacheStatus],
     current_profile: Option<&str>,
-) -> Result<String> {
+    view: PickerView,
+) -> Result<PickerSelection> {
     if profiles.is_empty() {
-        bail!("no complete AWS SSO profiles found");
+        bail_no_profiles();
     }
 
-    let entries = build_entries(profiles, statuses, current_profile);
-    let mut state = PickerState::new(entries, current_profile.map(str::to_string));
+    let model = PickerModel::new(profiles, statuses, current_profile);
+    let mut state = PickerState::new(model, view);
     state.run()
 }
 
+pub fn bail_no_profiles() -> ! {
+    eprintln!("  awsp: no SSO profiles found in ~/.aws/config");
+    eprintln!("  → add a [sso-session ...] block and at least one [profile ...]");
+    eprintln!(
+        "    see https://docs.aws.amazon.com/cli/latest/userguide/sso-configure-profile-token.html"
+    );
+    std::process::exit(1);
+}
+
 struct PickerState<'a> {
-    entries: Vec<PickerEntry<'a>>,
-    current_profile: Option<String>,
-    filtered: Vec<usize>,
-    selected: usize,
-    offset: usize,
-    filter: String,
-    mode: PickerMode,
+    model: PickerModel<'a>,
+    view: PickerView,
     rendered_lines: u16,
 }
 
 impl<'a> PickerState<'a> {
-    fn new(entries: Vec<PickerEntry<'a>>, current_profile: Option<String>) -> Self {
-        let mut state = Self {
-            entries,
-            current_profile,
-            filtered: Vec::new(),
-            selected: 0,
-            offset: 0,
-            filter: String::new(),
-            mode: PickerMode::Normal,
+    fn new(model: PickerModel<'a>, view: PickerView) -> Self {
+        Self {
+            model,
+            view,
             rendered_lines: 0,
-        };
-        state.apply_filter();
-        state
+        }
     }
 
-    fn run(&mut self) -> Result<String> {
+    fn run(&mut self) -> Result<PickerSelection> {
         let mut stderr = io::stderr();
         let _guard = TerminalGuard::enter(&mut stderr)?;
 
         loop {
             self.render(&mut stderr)?;
 
-            let Event::Key(key) = event::read().context("failed to read terminal input")? else {
-                continue;
+            let event = event::read().context("failed to read terminal input")?;
+            let command = match event {
+                Event::Key(key) => key_to_command(key, self.model.mode(), self.view),
+                Event::Resize(_, _) => PickerCommand::Noop,
+                _ => continue,
             };
 
-            match self.handle_key(key) {
-                Ok(Some(selection)) => {
+            match self.model.handle(command) {
+                PickerOutcome::Selected(selection) => {
                     self.clear_rendered(&mut stderr)?;
-                    return Ok(selection);
+                    return Ok(PickerSelection::Profile(selection));
                 }
-                Ok(None) => {}
-                Err(error) => {
+                PickerOutcome::Relogin(selection) => {
                     self.clear_rendered(&mut stderr)?;
-                    return Err(error);
+                    return Ok(PickerSelection::Relogin(selection));
                 }
-            }
-        }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> Result<Option<String>> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => bail!("profile selection cancelled"),
-                KeyCode::Char('l') => return Ok(None),
-                KeyCode::Char('y') => return Ok(None),
-                _ => return Ok(None),
-            }
-        }
-
-        match self.mode {
-            PickerMode::Normal => self.handle_normal_key(key),
-            PickerMode::Filter => self.handle_filter_key(key),
-        }
-    }
-
-    fn handle_normal_key(&mut self, key: KeyEvent) -> Result<Option<String>> {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_down(),
-            KeyCode::Home | KeyCode::Char('g') => self.jump_first(),
-            KeyCode::End | KeyCode::Char('G') => self.jump_last(),
-            KeyCode::Char('/') => self.mode = PickerMode::Filter,
-            KeyCode::Esc | KeyCode::Char('q') => bail!("profile selection cancelled"),
-            KeyCode::Enter => {
-                let Some(entry_index) = self.filtered.get(self.selected).copied() else {
+                PickerOutcome::Continue => {}
+                PickerOutcome::Cancelled => {
+                    self.clear_rendered(&mut stderr)?;
+                    std::process::exit(130);
+                }
+                PickerOutcome::NoMatch => {
+                    self.clear_rendered(&mut stderr)?;
                     bail!("no profiles match the current filter");
-                };
-                return Ok(Some(self.entries[entry_index].profile.name.clone()));
-            }
-            KeyCode::Char(value) if !value.is_control() => {
-                self.mode = PickerMode::Filter;
-                self.filter.push(value);
-                self.apply_filter();
-            }
-            _ => {}
-        }
-
-        Ok(None)
-    }
-
-    fn handle_filter_key(&mut self, key: KeyEvent) -> Result<Option<String>> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = PickerMode::Normal;
-                self.filter.clear();
-                self.apply_filter();
-            }
-            KeyCode::Enter => self.mode = PickerMode::Normal,
-            KeyCode::Backspace => {
-                self.filter.pop();
-                self.apply_filter();
-            }
-            KeyCode::Up => self.move_up(),
-            KeyCode::Down => self.move_down(),
-            KeyCode::Char(value) if !value.is_control() => {
-                self.filter.push(value);
-                self.apply_filter();
-            }
-            _ => {}
-        }
-
-        Ok(None)
-    }
-
-    fn move_up(&mut self) {
-        if self.filtered.is_empty() {
-            return;
-        }
-        self.selected = if self.selected == 0 {
-            self.filtered.len() - 1
-        } else {
-            self.selected - 1
-        };
-        self.keep_selection_visible();
-    }
-
-    fn move_down(&mut self) {
-        if self.filtered.is_empty() {
-            return;
-        }
-        self.selected = (self.selected + 1) % self.filtered.len();
-        self.keep_selection_visible();
-    }
-
-    fn jump_first(&mut self) {
-        self.selected = 0;
-        self.keep_selection_visible();
-    }
-
-    fn jump_last(&mut self) {
-        if !self.filtered.is_empty() {
-            self.selected = self.filtered.len() - 1;
-            self.keep_selection_visible();
-        }
-    }
-
-    fn apply_filter(&mut self) {
-        let needle = self.filter.trim().to_ascii_lowercase();
-        self.filtered = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                if needle.is_empty() || entry.search_text.contains(&needle) {
-                    Some(index)
-                } else {
-                    None
                 }
-            })
-            .collect();
-
-        if self.selected >= self.filtered.len() {
-            self.selected = self.filtered.len().saturating_sub(1);
+            }
         }
-        self.keep_selection_visible();
-    }
-
-    fn keep_selection_visible(&mut self) {
-        let visible_rows = self.visible_rows();
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if self.selected >= self.offset + visible_rows {
-            self.offset = self.selected.saturating_sub(visible_rows - 1);
-        }
-    }
-
-    fn visible_rows(&self) -> usize {
-        let terminal_height = terminal::size()
-            .map(|(_, height)| height as usize)
-            .unwrap_or(24);
-        let chrome_rows = if self.mode == PickerMode::Filter || !self.filter.is_empty() {
-            8
-        } else {
-            7
-        };
-        terminal_height
-            .saturating_sub(chrome_rows)
-            .max(1)
-            .clamp(1, MAX_VISIBLE_ROWS)
     }
 
     fn render(&mut self, stderr: &mut Stderr) -> Result<()> {
-        let (width, _) = terminal::size().unwrap_or((100, 24));
-        let width = cmp::max(width as usize, 60);
-        let visible_rows = self.visible_rows();
-        let end = cmp::min(self.filtered.len(), self.offset + visible_rows);
+        let (width, height) = terminal::size().unwrap_or((100, 24));
+        if width < 50 {
+            bail!("terminal too narrow");
+        }
+
+        self.model.set_terminal_height(height as usize);
+        let columns = Columns::for_width(width);
         let mut lines = 0_u16;
 
         if self.rendered_lines > 0 {
@@ -271,64 +140,47 @@ impl<'a> PickerState<'a> {
             )?;
         }
 
-        queue!(
-            stderr,
-            MoveToColumn(0),
-            Print("\r\n    "),
-            SetForegroundColor(palette::ACCENT),
-            SetAttribute(Attribute::Bold),
-            Print("▌"),
-            ResetColor,
-            SetForegroundColor(palette::FG),
-            SetAttribute(Attribute::Bold),
-            Print("  Choose a profile"),
-            SetAttribute(Attribute::Reset),
-            ResetColor,
-            Print("\r\n")
-        )?;
-        lines += 2;
-
-        self.render_current(stderr)?;
-        lines += 1;
-
-        if self.mode == PickerMode::Filter || !self.filter.is_empty() {
-            queue!(
-                stderr,
-                Print("    "),
-                SetForegroundColor(palette::DIM),
-                Print("Filter: "),
-                SetForegroundColor(palette::ACCENT),
-                Print(&self.filter),
-                ResetColor,
-                Print("\r\n")
-            )?;
+        if self.view == PickerView::Table {
+            self.render_table_header(stderr, &columns)?;
+            lines += 2;
+        } else {
+            self.render_status_or_filter(stderr)?;
+            lines += 1;
+            queue!(stderr, Print("\r\n"))?;
             lines += 1;
         }
 
-        queue!(stderr, Print("\r\n"))?;
-        lines += 1;
-
-        if self.filtered.is_empty() {
+        if self.model.filtered_len() == 0 {
             queue!(
                 stderr,
-                Print("    "),
-                SetForegroundColor(palette::DIM),
-                Print("No profiles match the current filter"),
+                Print("  "),
+                SetForegroundColor(palette::MUTED),
+                Print("no profiles match"),
                 ResetColor,
                 Print("\r\n")
             )?;
             lines += 1;
         } else {
-            for (visible_index, entry_index) in self.filtered[self.offset..end].iter().enumerate() {
-                let selected = self.offset + visible_index == self.selected;
-                self.render_row(stderr, &self.entries[*entry_index], selected, width)?;
+            for (visible_index, entry) in self.model.visible_entries() {
+                let selected = visible_index == self.model.selected();
+                match self.view {
+                    PickerView::Numbered => {
+                        self.render_numbered_row(stderr, visible_index, entry, selected, &columns)?
+                    }
+                    PickerView::Table => {
+                        self.render_table_row(stderr, entry, selected, &columns)?
+                    }
+                }
                 lines += 1;
             }
         }
 
         queue!(stderr, Print("\r\n"))?;
         lines += 1;
-        self.render_footer(stderr, visible_rows, width)?;
+        match self.view {
+            PickerView::Numbered => self.render_numbered_footer(stderr)?,
+            PickerView::Table => self.render_table_footer(stderr)?,
+        }
         lines += 1;
         self.rendered_lines = lines;
         stderr.flush().context("failed to render awsp picker")
@@ -352,37 +204,166 @@ impl<'a> PickerState<'a> {
         Ok(())
     }
 
-    fn render_current(&self, stderr: &mut Stderr) -> io::Result<()> {
-        queue!(stderr, Print("    "), SetForegroundColor(palette::DIM))?;
-        if let Some(current) = &self.current_profile {
+    fn render_status_or_filter(&self, stderr: &mut Stderr) -> io::Result<()> {
+        queue!(stderr, MoveToColumn(0))?;
+        if self.model.filter_is_visible() {
             queue!(
                 stderr,
-                Print("Currently active: "),
-                SetForegroundColor(palette::GREEN),
+                SetForegroundColor(palette::PINK),
                 SetAttribute(Attribute::Bold),
-                Print(current),
+                Print("/ "),
                 SetAttribute(Attribute::Reset),
-                ResetColor
+                SetForegroundColor(palette::FG),
+                Print(self.model.filter()),
+                Print("_"),
+                ResetColor,
+                Print("\r\n")
             )?;
-        } else {
-            queue!(stderr, Print("No active profile"), ResetColor)?;
+            return Ok(());
         }
-        queue!(stderr, Print("\r\n"))
+
+        let Some(current) = self.model.current_entry() else {
+            queue!(
+                stderr,
+                SetForegroundColor(palette::DIM),
+                Print("○"),
+                SetForegroundColor(palette::MUTED),
+                Print(" no active profile"),
+                SetForegroundColor(palette::DIM),
+                Print("  ·  hint: pick one below"),
+                ResetColor,
+                Print("\r\n")
+            )?;
+            return Ok(());
+        };
+
+        queue!(
+            stderr,
+            SetForegroundColor(palette::MINT),
+            Print("●"),
+            SetForegroundColor(palette::DIM),
+            Print(" active "),
+            SetForegroundColor(palette::FG),
+            SetAttribute(Attribute::Bold),
+            Print(&current.profile.name),
+            SetAttribute(Attribute::Reset)
+        )?;
+        separator(stderr)?;
+        queue!(
+            stderr,
+            SetForegroundColor(palette::MUTED),
+            Print(&current.profile.account_id)
+        )?;
+        separator(stderr)?;
+        queue!(
+            stderr,
+            SetForegroundColor(palette::CYAN),
+            Print(current.profile.region.label())
+        )?;
+        separator(stderr)?;
+        queue!(
+            stderr,
+            SetForegroundColor(palette::PURPLE),
+            Print(&current.profile.role_name)
+        )?;
+        separator(stderr)?;
+        render_session_status(stderr, &current.status)?;
+        queue!(stderr, ResetColor, Print("\r\n"))
     }
 
-    fn render_row(
+    fn render_numbered_row(
+        &self,
+        stderr: &mut Stderr,
+        visible_index: usize,
+        entry: &PickerEntry<'_>,
+        selected: bool,
+        columns: &Columns,
+    ) -> io::Result<()> {
+        let scroll_marker = scroll_marker_for(&self.model, visible_index);
+        let marker = if scroll_marker.is_empty() {
+            if selected {
+                "▸"
+            } else {
+                " "
+            }
+        } else {
+            scroll_marker
+        };
+        queue!(
+            stderr,
+            SetForegroundColor(if selected {
+                palette::PINK
+            } else {
+                palette::DIM
+            }),
+            SetAttribute(if selected {
+                Attribute::Bold
+            } else {
+                Attribute::Reset
+            }),
+            Print(marker),
+            SetAttribute(Attribute::Reset)
+        )?;
+
+        let hotkey = if visible_index < 9 {
+            format!(" {} ", visible_index + 1)
+        } else {
+            "   ".to_string()
+        };
+        queue!(
+            stderr,
+            SetForegroundColor(palette::PINK),
+            SetAttribute(Attribute::Bold),
+            Print(hotkey),
+            SetAttribute(Attribute::Reset)
+        )?;
+        self.render_profile_cells(stderr, entry, selected, columns)?;
+        if entry.is_current {
+            queue!(
+                stderr,
+                SetForegroundColor(palette::GREEN),
+                Print("  ◀ current"),
+                ResetColor
+            )?;
+        }
+        queue!(stderr, ResetColor, Print("\r\n"))
+    }
+
+    fn render_table_header(&self, stderr: &mut Stderr, columns: &Columns) -> io::Result<()> {
+        queue!(
+            stderr,
+            MoveToColumn(0),
+            Print("  "),
+            SetForegroundColor(palette::MUTED),
+            SetAttribute(Attribute::Bold),
+            Print(format!("{:<26}", "PROFILE")),
+            Print(format!("{:<15}", "ACCOUNT"))
+        )?;
+        if columns.show_region {
+            queue!(stderr, Print(format!("{:<18}", "REGION")))?;
+        }
+        if columns.show_role {
+            queue!(stderr, Print("ROLE"))?;
+        }
+        queue!(
+            stderr,
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Print("\r\n  "),
+            SetForegroundColor(palette::DIM),
+            Print("─".repeat(TABLE_RULE_WIDTH)),
+            ResetColor,
+            Print("\r\n")
+        )
+    }
+
+    fn render_table_row(
         &self,
         stderr: &mut Stderr,
         entry: &PickerEntry<'_>,
         selected: bool,
-        width: usize,
+        columns: &Columns,
     ) -> io::Result<()> {
-        let marker = if selected { "▸" } else { "·" };
-        let region = entry.profile.region.label();
-        let pill = format!("[{}]", entry.env);
-        let prefix_width = 4 + 2 + NAME_WIDTH + 2 + pill.len() + 2;
-        let region_width = width.saturating_sub(prefix_width).max(region.len());
-
         if selected {
             queue!(
                 stderr,
@@ -392,11 +373,19 @@ impl<'a> PickerState<'a> {
             )?;
         }
 
-        queue!(stderr, Print("    "))?;
+        let marker = if selected {
+            "▸ "
+        } else if entry.is_current {
+            "● "
+        } else {
+            "  "
+        };
         queue!(
             stderr,
             SetForegroundColor(if selected {
-                palette::ACCENT
+                palette::PINK
+            } else if entry.is_current {
+                palette::GREEN
             } else {
                 palette::DIM
             }),
@@ -405,16 +394,26 @@ impl<'a> PickerState<'a> {
             } else {
                 Attribute::Reset
             }),
-            Print(format!("{marker} ")),
+            Print(marker),
             SetAttribute(Attribute::Reset)
         )?;
+        self.render_profile_cells(stderr, entry, selected, columns)?;
+        queue!(stderr, ResetColor, Print("\r\n"))
+    }
 
+    fn render_profile_cells(
+        &self,
+        stderr: &mut Stderr,
+        entry: &PickerEntry<'_>,
+        selected: bool,
+        columns: &Columns,
+    ) -> io::Result<()> {
         queue!(
             stderr,
-            SetForegroundColor(if selected {
-                palette::FG
+            SetForegroundColor(if entry.is_current {
+                palette::GREEN
             } else {
-                palette::MUTED
+                palette::FG
             }),
             SetAttribute(if selected {
                 Attribute::Bold
@@ -423,125 +422,162 @@ impl<'a> PickerState<'a> {
             }),
             Print(pad_or_truncate(&entry.profile.name, NAME_WIDTH)),
             SetAttribute(Attribute::Reset),
-            ResetColor,
-            Print("  "),
-            SetForegroundColor(palette::env_color(entry.env)),
-            SetAttribute(Attribute::Bold),
-            Print(pill),
-            SetAttribute(Attribute::Reset),
-            ResetColor,
-            Print("  "),
-            SetForegroundColor(palette::DIM),
-            Print(format!("{region:>region_width$}")),
-            ResetColor
+            SetForegroundColor(palette::MUTED),
+            Print(pad_or_truncate(&entry.profile.account_id, ACCOUNT_WIDTH))
         )?;
-
-        if selected {
-            let used_width = prefix_width + region_width;
-            if used_width < width {
-                queue!(stderr, Print(" ".repeat(width - used_width)))?;
-            }
-            queue!(stderr, ResetColor)?;
+        if columns.show_region {
+            queue!(
+                stderr,
+                SetForegroundColor(palette::CYAN),
+                Print(pad_or_truncate(&entry.profile.region.label(), REGION_WIDTH))
+            )?;
         }
-        queue!(stderr, Print("\r\n"))
+        if columns.show_role {
+            queue!(
+                stderr,
+                SetForegroundColor(palette::PURPLE),
+                Print(&entry.profile.role_name)
+            )?;
+        }
+        Ok(())
     }
 
-    fn render_footer(
-        &self,
-        stderr: &mut Stderr,
-        visible_rows: usize,
-        width: usize,
-    ) -> io::Result<()> {
-        let hint = "↑↓ navigate  ·  enter select  ·  / filter  ·  esc cancel";
-        queue!(stderr, Print("    "), SetForegroundColor(palette::DIM))?;
-        queue!(stderr, Print(hint))?;
+    fn render_numbered_footer(&self, stderr: &mut Stderr) -> io::Result<()> {
+        queue!(stderr, Print("  "))?;
+        footer_key(stderr, "1-9")?;
+        footer_word(stderr, " jump  ")?;
+        footer_key(stderr, "↑↓")?;
+        footer_word(stderr, " nav  ")?;
+        footer_key(stderr, "/")?;
+        footer_word(stderr, " filter  ")?;
+        footer_key(stderr, "⏎")?;
+        footer_word(stderr, " switch  ")?;
+        footer_key(stderr, "r")?;
+        footer_word(stderr, " re-login  ")?;
+        footer_key(stderr, "q")?;
+        footer_word(stderr, " quit")?;
+        queue!(stderr, ResetColor, Print("\r\n"))
+    }
 
-        if self.filtered.len() > visible_rows || !self.filter.is_empty() {
-            let start = if self.filtered.is_empty() {
-                0
-            } else {
-                self.offset + 1
-            };
-            let end = cmp::min(self.filtered.len(), self.offset + visible_rows);
-            let count = format!("{start}-{end} of {}", self.filtered.len());
-            let used = 4 + hint.chars().count();
-            if width > used + count.len() {
-                queue!(stderr, Print(" ".repeat(width - used - count.len())))?;
-            } else {
-                queue!(stderr, Print("  "))?;
-            }
-            queue!(stderr, Print(count))?;
+    fn render_table_footer(&self, stderr: &mut Stderr) -> io::Result<()> {
+        queue!(
+            stderr,
+            Print("  "),
+            SetForegroundColor(palette::DIM),
+            Print(format!("{} profiles · ", self.model.filtered_len()))
+        )?;
+        if let Some(current) = self.model.current_entry() {
+            render_session_status(stderr, &current.status)?;
+        } else {
+            queue!(
+                stderr,
+                SetForegroundColor(palette::MUTED),
+                Print("no active profile")
+            )?;
         }
-
+        queue!(stderr, SetForegroundColor(palette::DIM), Print("  ────  "))?;
+        footer_key(stderr, "↑↓")?;
+        footer_word(stderr, "·")?;
+        footer_key(stderr, "⏎")?;
+        footer_word(stderr, "·")?;
+        footer_key(stderr, "/")?;
+        footer_word(stderr, "·")?;
+        footer_key(stderr, "q")?;
         queue!(stderr, ResetColor, Print("\r\n"))
     }
 }
 
-fn build_entries<'a>(
-    profiles: &'a [SsoProfile],
-    statuses: &[LoginStatus],
-    current_profile: Option<&str>,
-) -> Vec<PickerEntry<'a>> {
-    let mut entries = profiles
-        .iter()
-        .enumerate()
-        .map(|(original_index, profile)| {
-            let env = detect_env(&profile.name);
-            PickerEntry {
-                profile,
-                status: statuses
-                    .get(original_index)
-                    .copied()
-                    .unwrap_or(LoginStatus::Unknown),
-                env,
-                is_current: Some(profile.name.as_str()) == current_profile,
-                search_text: format!(
-                    "{} {} {} {}",
-                    profile.name,
-                    profile.role_name,
-                    profile.region.label(),
-                    env
-                )
-                .to_ascii_lowercase(),
+fn key_to_command(key: KeyEvent, mode: PickerMode, view: PickerView) -> PickerCommand {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => PickerCommand::Cancel,
+            KeyCode::Char('y') => PickerCommand::Noop,
+            _ => PickerCommand::Noop,
+        };
+    }
+
+    if mode == PickerMode::Filter {
+        return match key.code {
+            KeyCode::Esc => PickerCommand::Cancel,
+            KeyCode::Enter => PickerCommand::Enter,
+            KeyCode::Backspace => PickerCommand::Backspace,
+            KeyCode::Up | KeyCode::Char('k') => PickerCommand::Up,
+            KeyCode::Down | KeyCode::Char('j') => PickerCommand::Down,
+            KeyCode::Char(value @ '1'..='9') => {
+                PickerCommand::JumpVisible(value as usize - '1' as usize)
             }
-        })
-        .collect::<Vec<_>>();
-
-    entries.sort_by(|left, right| {
-        picker_rank(left)
-            .cmp(&picker_rank(right))
-            .then_with(|| left.profile.name.cmp(&right.profile.name))
-    });
-
-    entries
-}
-
-fn picker_rank(entry: &PickerEntry<'_>) -> u8 {
-    if entry.is_current {
-        return 0;
+            KeyCode::Char(value) if !value.is_control() => PickerCommand::Input(value),
+            _ => PickerCommand::Noop,
+        };
     }
 
-    match entry.status {
-        LoginStatus::Valid => 1,
-        LoginStatus::Expired => 2,
-        LoginStatus::Unknown => 3,
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => PickerCommand::Up,
+        KeyCode::Down | KeyCode::Char('j') => PickerCommand::Down,
+        KeyCode::Home | KeyCode::Char('g') => PickerCommand::First,
+        KeyCode::End | KeyCode::Char('G') => PickerCommand::Last,
+        KeyCode::Char('/') => PickerCommand::StartFilter,
+        KeyCode::Char('r') => PickerCommand::Relogin,
+        KeyCode::Esc | KeyCode::Char('q') => PickerCommand::Cancel,
+        KeyCode::Enter => PickerCommand::Enter,
+        KeyCode::Char(value @ '1'..='9') if view == PickerView::Numbered => {
+            PickerCommand::JumpVisible(value as usize - '1' as usize)
+        }
+        KeyCode::Char(value) if !value.is_control() => PickerCommand::Input(value),
+        _ => PickerCommand::Noop,
     }
 }
 
-pub fn detect_env(profile_name: &str) -> &'static str {
-    let name = profile_name.to_ascii_lowercase();
-    if name.contains("prod") || name.contains("production") {
-        "prod"
-    } else if name.contains("stag") || name.contains("staging") || name.contains("preprod") {
-        "staging"
-    } else if name.contains("dev") || name.contains("sandbox") || name.contains("test") {
-        "dev"
-    } else if name.contains("personal") {
-        "personal"
-    } else if name.contains("client") || name.contains("customer") {
-        "client"
+fn render_session_status(stderr: &mut Stderr, status: &CacheStatus) -> io::Result<()> {
+    let color = match status.expires_in_seconds() {
+        Some(seconds) if seconds < 0 => palette::RED,
+        Some(seconds) if seconds < 3600 => palette::YELLOW,
+        Some(_) => palette::GREEN,
+        None => palette::MUTED,
+    };
+    queue!(stderr, SetForegroundColor(color), Print(status.label()))
+}
+
+fn separator(stderr: &mut Stderr) -> io::Result<()> {
+    queue!(stderr, SetForegroundColor(palette::DIM), Print("  ·  "))
+}
+
+fn footer_key(stderr: &mut Stderr, key: &str) -> io::Result<()> {
+    queue!(
+        stderr,
+        SetForegroundColor(palette::PINK),
+        SetAttribute(Attribute::Bold),
+        Print(key),
+        SetAttribute(Attribute::Reset)
+    )
+}
+
+fn footer_word(stderr: &mut Stderr, word: &str) -> io::Result<()> {
+    queue!(stderr, SetForegroundColor(palette::DIM), Print(word))
+}
+
+fn scroll_marker_for(model: &PickerModel<'_>, visible_index: usize) -> &'static str {
+    if visible_index == model.offset() && model.has_rows_before() {
+        "↑↑"
+    } else if visible_index + 1 == model.offset() + model.visible_rows() && model.has_rows_after() {
+        "↓↓"
     } else {
-        "dev"
+        ""
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Columns {
+    show_region: bool,
+    show_role: bool,
+}
+
+impl Columns {
+    fn for_width(width: u16) -> Self {
+        Self {
+            show_region: width >= 60,
+            show_role: width >= 80,
+        }
     }
 }
 
@@ -557,45 +593,36 @@ fn pad_or_truncate(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aws_config::RegionDisplay;
-
-    fn profile(name: &str) -> SsoProfile {
-        SsoProfile {
-            name: name.to_string(),
-            sso_session: Some("corp".to_string()),
-            sso_start_url: "https://example.awsapps.com/start".to_string(),
-            sso_region: "us-east-1".to_string(),
-            account_id: "123456789012".to_string(),
-            role_name: "Admin".to_string(),
-            region: RegionDisplay::Profile("us-east-1".to_string()),
-        }
-    }
-
-    #[test]
-    fn current_profile_is_first_without_filtering_rows() {
-        let profiles = vec![profile("dev"), profile("prod"), profile("staging")];
-        let statuses = vec![LoginStatus::Valid, LoginStatus::Unknown, LoginStatus::Valid];
-        let entries = build_entries(&profiles, &statuses, Some("prod"));
-
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].profile.name, "prod");
-        assert!(entries.iter().any(|entry| entry.profile.name == "dev"));
-        assert!(entries.iter().any(|entry| entry.profile.name == "staging"));
-    }
-
-    #[test]
-    fn derives_environment_from_profile_name() {
-        assert_eq!(detect_env("acme-prod-admin"), "prod");
-        assert_eq!(detect_env("acme-staging-dev"), "staging");
-        assert_eq!(detect_env("acme-dev-sandbox"), "dev");
-        assert_eq!(detect_env("personal-playground"), "personal");
-        assert_eq!(detect_env("client-northwind"), "client");
-        assert_eq!(detect_env("shared-tools"), "dev");
-    }
 
     #[test]
     fn pads_and_truncates_profile_names() {
         assert_eq!(pad_or_truncate("abc", 5), "abc  ");
         assert_eq!(pad_or_truncate("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn maps_number_keys_only_for_numbered_normal_view() {
+        let one = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(
+            key_to_command(one, PickerMode::Normal, PickerView::Numbered),
+            PickerCommand::JumpVisible(0)
+        );
+        assert_eq!(
+            key_to_command(one, PickerMode::Normal, PickerView::Table),
+            PickerCommand::Input('1')
+        );
+    }
+
+    #[test]
+    fn maps_filter_letters_as_input() {
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(
+            key_to_command(q, PickerMode::Normal, PickerView::Numbered),
+            PickerCommand::Cancel
+        );
+        assert_eq!(
+            key_to_command(q, PickerMode::Filter, PickerView::Numbered),
+            PickerCommand::Input('q')
+        );
     }
 }

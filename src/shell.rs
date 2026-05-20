@@ -1,3 +1,5 @@
+use crate::aws_config::SsoProfile;
+use crate::picker_model;
 use clap::ValueEnum;
 use std::env;
 use std::path::Path;
@@ -37,7 +39,29 @@ fi
 
 awsp() {{
   case "${{1-}}" in
-    ""|use|activate|off|clear|restore)
+    "" )
+      local __awsp_output
+      local __awsp_status
+      __awsp_output="$(command awsp __shell)"
+      __awsp_status=$?
+      if [ $__awsp_status -eq 0 ]; then
+        eval "$__awsp_output"
+      else
+        return $__awsp_status
+      fi
+      ;;
+    --table)
+      local __awsp_output
+      local __awsp_status
+      __awsp_output="$(command awsp __shell table)"
+      __awsp_status=$?
+      if [ $__awsp_status -eq 0 ]; then
+        eval "$__awsp_output"
+      else
+        return $__awsp_status
+      fi
+      ;;
+    use|activate|off|clear|restore)
       local __awsp_output
       local __awsp_status
       __awsp_output="$(command awsp __shell "$@")"
@@ -53,8 +77,19 @@ awsp() {{
         return $__awsp_status
       fi
       ;;
-    *)
+    init|setup|new-session-id|list|profiles|login|login-session|exec|logout|current|whoami|status|doctor|-h|--help|-V|--version)
       command awsp "$@"
+      ;;
+    *)
+      local __awsp_output
+      local __awsp_status
+      __awsp_output="$(command awsp __shell query "$@")"
+      __awsp_status=$?
+      if [ $__awsp_status -eq 0 ]; then
+        eval "$__awsp_output"
+      else
+        return $__awsp_status
+      fi
       ;;
   esac
 }}
@@ -73,6 +108,29 @@ pub fn activation_code(profile: &str, session_id: Option<&str>) -> String {
     lines.push("unset AWS_SESSION_EXPIRATION".to_string());
     lines.push(format!("export AWS_PROFILE={}", quote(profile)));
     lines.push("export AWS_SDK_LOAD_CONFIG='1'".to_string());
+    lines.push("unset AWSP_PROD".to_string());
+    lines.join("\n")
+}
+
+pub fn activation_code_for_profile(profile: &SsoProfile, session_id: Option<&str>) -> String {
+    let mut lines = Vec::new();
+    if let Some(session_id) = session_id {
+        lines.push(format!("export AWSP_SESSION_ID={}", quote(session_id)));
+    }
+    lines.push("unset AWS_ACCESS_KEY_ID".to_string());
+    lines.push("unset AWS_SECRET_ACCESS_KEY".to_string());
+    lines.push("unset AWS_SESSION_TOKEN".to_string());
+    lines.push("unset AWS_SESSION_EXPIRATION".to_string());
+    lines.push(format!("export AWS_PROFILE={}", quote(&profile.name)));
+    if let Some(region) = profile.region.export_value() {
+        lines.push(format!("export AWS_REGION={}", quote(region)));
+    }
+    lines.push("export AWS_SDK_LOAD_CONFIG='1'".to_string());
+    if picker_model::is_prod_profile(&profile.name) {
+        lines.push("export AWSP_PROD='1'".to_string());
+    } else {
+        lines.push("unset AWSP_PROD".to_string());
+    }
     lines.join("\n")
 }
 
@@ -82,11 +140,13 @@ pub fn off_code(session_id: Option<&str>) -> String {
         lines.push(format!("export AWSP_SESSION_ID={}", quote(session_id)));
     }
     lines.push("unset AWS_PROFILE".to_string());
+    lines.push("unset AWS_REGION".to_string());
     lines.push("unset AWS_ACCESS_KEY_ID".to_string());
     lines.push("unset AWS_SECRET_ACCESS_KEY".to_string());
     lines.push("unset AWS_SESSION_TOKEN".to_string());
     lines.push("unset AWS_SESSION_EXPIRATION".to_string());
     lines.push("export AWS_SDK_LOAD_CONFIG='1'".to_string());
+    lines.push("unset AWSP_PROD".to_string());
     lines.join("\n")
 }
 
@@ -111,13 +171,14 @@ mod tests {
         assert!(code.contains("export AWS_PROFILE='prod'"));
         assert!(code.contains("export AWS_SDK_LOAD_CONFIG='1'"));
         assert!(code.contains("unset AWS_ACCESS_KEY_ID"));
+        assert!(code.contains("unset AWSP_PROD"));
     }
 
     #[test]
     fn init_script_does_not_run_awsp_during_shell_startup() {
         let script = init_script(ShellKind::Zsh);
         assert!(!script.contains("awsp init"));
-        assert!(!script.contains("new-session-id"));
         assert!(!script.contains("__shell restore"));
+        assert!(!script.contains("$(awsp"));
     }
 }
