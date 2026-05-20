@@ -20,11 +20,11 @@ Build and package the Apple Silicon macOS binary:
 
 ```sh
 cargo build --release --target aarch64-apple-darwin
-mkdir -p /tmp/awsp-v0.1.0-beta.7-aarch64-apple-darwin
-install -m 0755 target/aarch64-apple-darwin/release/awsp /tmp/awsp-v0.1.0-beta.7-aarch64-apple-darwin/awsp
-tar -czf /tmp/awsp-v0.1.0-beta.7-aarch64-apple-darwin.tar.gz -C /tmp awsp-v0.1.0-beta.7-aarch64-apple-darwin
-shasum -a 256 /tmp/awsp-v0.1.0-beta.7-aarch64-apple-darwin.tar.gz
-gh release upload v0.1.0-beta.7 /tmp/awsp-v0.1.0-beta.7-aarch64-apple-darwin.tar.gz --repo nomadsre/awsp
+mkdir -p /tmp/awsp-v0.1.0-beta.8-aarch64-apple-darwin
+install -m 0755 target/aarch64-apple-darwin/release/awsp /tmp/awsp-v0.1.0-beta.8-aarch64-apple-darwin/awsp
+tar -czf /tmp/awsp-v0.1.0-beta.8-aarch64-apple-darwin.tar.gz -C /tmp awsp-v0.1.0-beta.8-aarch64-apple-darwin
+shasum -a 256 /tmp/awsp-v0.1.0-beta.8-aarch64-apple-darwin.tar.gz
+gh release upload v0.1.0-beta.8 /tmp/awsp-v0.1.0-beta.8-aarch64-apple-darwin.tar.gz --repo nomadsre/awsp
 ```
 
 Copy `packaging/homebrew/awsp-beta.rb` into the tap repo as:
@@ -33,10 +33,10 @@ Copy `packaging/homebrew/awsp-beta.rb` into the tap repo as:
 Formula/awsp-beta.rb
 ```
 
-The `v0.1.0-beta.7` Apple Silicon binary checksum is already filled in:
+The `v0.1.0-beta.8` Apple Silicon binary checksum is already filled in:
 
 ```text
-171d6a68b7110363187dd000c5aa872d8edc6cabfcf537367ba4f596cdf64f54
+5e1a8260cbfefb384026f99ed5cd2800aae4b699cf1b837785fea22a835c347f
 ```
 
 Install from another machine:
