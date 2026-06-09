@@ -1,4 +1,4 @@
-# Copy this file to github.com/arseniizakharov/homebrew-awsp as Formula/awsp.rb.
+# Copy this file to github.com/arseniizakharov/homebrew-formulae as Formula/awsp.rb.
 
 class Awsp < Formula
   desc "AWS CLI sessions manager"

@@ -3,10 +3,10 @@
 `awsp` is distributed through a dedicated Homebrew tap repo:
 
 - app repo: `github.com/arseniizakharov/awsp`
-- tap repo: `github.com/arseniizakharov/homebrew-awsp`
+- tap repo: `github.com/arseniizakharov/homebrew-formulae`
 
-Homebrew maps the tap name `arseniizakharov/awsp` to the repository
-`arseniizakharov/homebrew-awsp`.
+Homebrew maps the tap name `arseniizakharov/formulae` to the repository
+`arseniizakharov/homebrew-formulae`.
 
 ## Release
 
@@ -43,7 +43,7 @@ f3d2090ccee044bf734164a067c221053f2aff41db534e6edfd590bcca5cc0d6
 Install from another machine:
 
 ```sh
-brew tap arseniizakharov/awsp
+brew tap arseniizakharov/formulae
 brew install awsp
 ```
 
