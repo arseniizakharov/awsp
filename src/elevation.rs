@@ -194,6 +194,18 @@ struct TeamIdentity {
     group_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RequestRequester {
+    email: Option<String>,
+    username: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RequestApprovers {
+    approvers: Vec<String>,
+    approver_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct RequestTarget {
     account_id: String,
@@ -219,9 +231,11 @@ pub fn request_access(
     if let Some(existing) = client.find_pending_request(&target)? {
         return Ok(existing);
     }
-    if target.approval_required {
-        client.ensure_approver_available(&target, &identity)?;
-    }
+    let approvers = if target.approval_required {
+        client.resolve_request_approvers(&target, &identity)?
+    } else {
+        RequestApprovers::default()
+    };
     let input = collect_request_input(profile, &target, options)?;
 
     if !options.yes {
@@ -234,7 +248,7 @@ pub fn request_access(
         }
     }
 
-    client.create_request(&target, &input)
+    client.create_request(&target, &input, &approvers)
 }
 
 pub fn team_login(options: TeamLoginOptions) -> Result<()> {
@@ -439,9 +453,20 @@ impl TeamConfig {
     }
 
     fn requester_email(&self) -> Option<String> {
-        self.id_token
-            .as_deref()
-            .and_then(|token| jwt_string_claim(token, "email"))
+        jwt_string_claim(self.create_token(), "email")
+            .or_else(|| {
+                self.id_token
+                    .as_deref()
+                    .and_then(|token| jwt_string_claim(token, "email"))
+            })
+            .or_else(|| jwt_string_claim(&self.access_token, "email"))
+    }
+
+    fn requester(&self) -> RequestRequester {
+        RequestRequester {
+            email: self.requester_email(),
+            username: team_router_username_claim(self.create_token()),
+        }
     }
 
     fn create_token_claim_summary(&self) -> String {
@@ -766,29 +791,26 @@ impl TeamClient {
         Ok(None)
     }
 
-    fn ensure_approver_available(
+    fn resolve_request_approvers(
         &self,
         target: &RequestTarget,
         identity: &TeamIdentity,
-    ) -> Result<()> {
+    ) -> Result<RequestApprovers> {
         let mut checked = Vec::new();
-        if self.approver_scope_has_required_members(
+        if let Some(approvers) = self.approvers_for_scope(
             "account",
             &target.account_id,
             &identity.group_ids,
             &mut checked,
         )? {
-            return Ok(());
+            return Ok(approvers);
         }
 
         if let Some(ou_id) = self.parent_ou_id(&target.account_id)? {
-            if self.approver_scope_has_required_members(
-                "OU",
-                &ou_id,
-                &identity.group_ids,
-                &mut checked,
-            )? {
-                return Ok(());
+            if let Some(approvers) =
+                self.approvers_for_scope("OU", &ou_id, &identity.group_ids, &mut checked)?
+            {
+                return Ok(approvers);
             }
         }
 
@@ -804,24 +826,32 @@ impl TeamClient {
         );
     }
 
-    fn approver_scope_has_required_members(
+    fn approvers_for_scope(
         &self,
         scope_name: &str,
         scope_id: &str,
         requester_group_ids: &[String],
         checked: &mut Vec<String>,
-    ) -> Result<bool> {
+    ) -> Result<Option<RequestApprovers>> {
         let Some(approver_group_ids) = self.approver_group_ids(scope_id)? else {
             checked.push(format!("{scope_name} {scope_id}: no approver group"));
-            return Ok(false);
+            return Ok(None);
         };
-        let member_count = self.approver_member_count(&approver_group_ids)?;
+        let members = self.approver_members(&approver_group_ids)?;
+        let member_count = members.len();
         let required = required_approver_members(requester_group_ids, &approver_group_ids);
         checked.push(format!(
             "{scope_name} {scope_id}: {member_count}/{required} approver members"
         ));
 
-        Ok(member_count >= required)
+        if member_count >= required {
+            Ok(Some(RequestApprovers {
+                approvers: members,
+                approver_ids: approver_group_ids,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn approver_group_ids(&self, id: &str) -> Result<Option<Vec<String>>> {
@@ -856,7 +886,7 @@ impl TeamClient {
             .map(str::to_string))
     }
 
-    fn approver_member_count(&self, approver_group_ids: &[String]) -> Result<usize> {
+    fn approver_members(&self, approver_group_ids: &[String]) -> Result<Vec<String>> {
         let data = self.call_graphql(
             LIST_GROUPS,
             json!({
@@ -868,13 +898,20 @@ impl TeamClient {
             .and_then(|value| value.get("members"))
             .and_then(Value::as_array)
             .context("TEAM listGroups response missing members")?;
-        Ok(members.len())
+        Ok(members
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     fn create_request(
         &self,
         target: &RequestTarget,
         input: &RequestInput,
+        approvers: &RequestApprovers,
     ) -> Result<ElevationOutcome> {
         let create_token = self.config.create_token();
         if !token_has_team_router_username(create_token) {
@@ -887,7 +924,13 @@ impl TeamClient {
             create_token,
             CREATE_REQUEST,
             json!({
-                "input": create_request_input(target, input, Utc::now().to_rfc3339())
+                "input": create_request_input(
+                    target,
+                    input,
+                    &self.config.requester(),
+                    approvers,
+                    Utc::now().to_rfc3339()
+                )
             }),
         )?;
         let request = data
@@ -1005,17 +1048,49 @@ struct RequestInput {
     justification: String,
 }
 
-fn create_request_input(target: &RequestTarget, input: &RequestInput, start_time: String) -> Value {
-    json!({
+fn create_request_input(
+    target: &RequestTarget,
+    input: &RequestInput,
+    requester: &RequestRequester,
+    approvers: &RequestApprovers,
+    start_time: String,
+) -> Value {
+    let mut value = json!({
         "accountId": target.account_id,
         "accountName": target.account_name,
         "role": target.role_name,
         "roleId": target.role_id,
         "startTime": start_time,
         "duration": input.duration_hours,
+        "session_duration": input.duration_hours,
         "justification": input.justification,
         "ticketNo": input.ticket_no,
-    })
+    });
+
+    if let Some(email) = requester
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        value["email"] = json!(email);
+    }
+    if let Some(username) = requester
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        value["username"] = json!(username);
+    }
+    if !approvers.approvers.is_empty() {
+        value["approvers"] = json!(approvers.approvers);
+    }
+    if !approvers.approver_ids.is_empty() {
+        value["approver_ids"] = json!(approvers.approver_ids);
+    }
+
+    value
 }
 
 fn collect_request_input(
@@ -2366,6 +2441,9 @@ case "$payload" in
   *GetEntitlement*)
     printf '%s' '{"data":{"getEntitlement":[{"accounts":[{"name":"prod","id":"111122223333"}],"permissions":[{"name":"Admin","id":"role-1"}],"approvalRequired":true,"duration":"4"}]}}'
     ;;
+  *RequestByEmailAndStatus*)
+    printf '%s' '{"data":{"requestByEmailAndStatus":{"items":[]}}}'
+    ;;
   *ValidateRequest*)
     printf '%s' '{"errors":[{"message":"Validation error of type UnknownArgument: Unknown field argument accountId @ '\''validateRequest'\''"},{"message":"Validation error of type FieldUndefined: Field '\''valid'\'' in type '\''requests'\'' is undefined @ '\''validateRequest/valid'\''"}]}'
     ;;
@@ -2408,7 +2486,7 @@ esac
             format!(
                 "e30.{}.",
                 base64_url_encode(
-                    br#"{"userId":"u-1","groupIds":["requester-group"],"cognito:username":"IDC_user@example.com","exp":4102444800}"#
+                    br#"{"email":"user@example.com","userId":"u-1","groupIds":["requester-group"],"cognito:username":"IDC_user@example.com","exp":4102444800}"#
                 )
             ),
         );
@@ -2443,6 +2521,11 @@ esac
         assert!(log.contains("GetApprovers"));
         assert!(log.contains("ListGroups"));
         assert!(log.contains("CreateRequests"));
+        assert!(log.contains("\"email\":\"user@example.com\""));
+        assert!(log.contains("\"username\":\"IDC_user@example.com\""));
+        assert!(log.contains("\"approvers\":[\"approver@example.com\"]"));
+        assert!(log.contains("\"approver_ids\":[\"approver-group\"]"));
+        assert!(log.contains("\"session_duration\":\"2\""));
         assert!(!log.contains("ValidateRequest"));
 
         Ok(())
@@ -2464,7 +2547,22 @@ esac
             justification: "deploy".to_string(),
         };
 
-        let value = create_request_input(&target, &input, "2026-06-09T12:00:00Z".to_string());
+        let requester = RequestRequester {
+            email: Some("user@example.com".to_string()),
+            username: Some("IDC_user@example.com".to_string()),
+        };
+        let approvers = RequestApprovers {
+            approvers: vec!["approver@example.com".to_string()],
+            approver_ids: vec!["approver-group".to_string()],
+        };
+
+        let value = create_request_input(
+            &target,
+            &input,
+            &requester,
+            &approvers,
+            "2026-06-09T12:00:00Z".to_string(),
+        );
 
         assert_eq!(
             value,
@@ -2475,11 +2573,15 @@ esac
                 "roleId": "arn:aws:sso:::permissionSet/ssoins-1/ps-1",
                 "startTime": "2026-06-09T12:00:00Z",
                 "duration": "2",
+                "session_duration": "2",
+                "email": "user@example.com",
+                "username": "IDC_user@example.com",
+                "approvers": ["approver@example.com"],
+                "approver_ids": ["approver-group"],
                 "justification": "deploy",
                 "ticketNo": "1234",
             })
         );
-        assert!(value.get("email").is_none());
     }
 
     #[test]
