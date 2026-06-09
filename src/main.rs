@@ -159,6 +159,9 @@ enum Command {
 enum TeamCommand {
     /// Sign in to TEAM and cache Cognito tokens.
     Login {
+        /// Discover TEAM config from the Amplify app URL.
+        #[arg(long)]
+        app_url: Option<String>,
         /// TEAM AppSync GraphQL endpoint.
         #[arg(long)]
         endpoint: Option<String>,
@@ -273,6 +276,7 @@ fn run() -> Result<()> {
         ),
         Some(Command::Team { command }) => match command {
             TeamCommand::Login {
+                app_url,
                 endpoint,
                 domain,
                 client_id,
@@ -283,6 +287,7 @@ fn run() -> Result<()> {
                 redirected_url,
                 no_open,
             } => elevation::team_login(TeamLoginOptions {
+                app_url,
                 graphql_endpoint: endpoint,
                 cognito_domain: domain,
                 client_id,

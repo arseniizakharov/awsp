@@ -64,6 +64,7 @@ pub struct ElevationOptions {
 
 #[derive(Debug, Clone, Default)]
 pub struct TeamLoginOptions {
+    pub app_url: Option<String>,
     pub graphql_endpoint: Option<String>,
     pub cognito_domain: Option<String>,
     pub client_id: Option<String>,
@@ -96,6 +97,15 @@ struct TeamAuthConfig {
     redirect_uri: String,
     scopes: String,
     idp_identifier: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TeamAppConfig {
+    graphql_endpoint: String,
+    cognito_domain: String,
+    client_id: String,
+    redirect_uri: String,
+    scopes: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -272,41 +282,58 @@ impl TeamConfig {
 impl TeamAuthConfig {
     fn resolve(options: &TeamLoginOptions) -> Result<Self> {
         let current = state::get_team_state()?;
-        let graphql_endpoint = option_or_env_or_state(
+        let discovered = match options.app_url.as_deref() {
+            Some(app_url) => Some(discover_team_app_config(app_url)?),
+            None => None,
+        };
+        let graphql_endpoint = option_or_env_or_discovered_or_state(
             &options.graphql_endpoint,
             TEAM_ENDPOINT_ENV,
+            discovered
+                .as_ref()
+                .map(|config| config.graphql_endpoint.as_str()),
             current.as_ref().map(|team| team.graphql_endpoint.as_str()),
         )
         .context(
             "TEAM GraphQL endpoint is required; pass --endpoint or set AWSP_TEAM_GRAPHQL_ENDPOINT",
         )?;
-        let cognito_domain = option_or_env_or_state(
+        let cognito_domain = option_or_env_or_discovered_or_state(
             &options.cognito_domain,
             TEAM_COGNITO_DOMAIN_ENV,
+            discovered
+                .as_ref()
+                .map(|config| config.cognito_domain.as_str()),
             current.as_ref().map(|team| team.cognito_domain.as_str()),
         )
         .context(
             "TEAM Cognito domain is required; pass --domain or set AWSP_TEAM_COGNITO_DOMAIN",
         )?;
-        let client_id = option_or_env_or_state(
+        let client_id = option_or_env_or_discovered_or_state(
             &options.client_id,
             TEAM_CLIENT_ID_ENV,
+            discovered.as_ref().map(|config| config.client_id.as_str()),
             current.as_ref().map(|team| team.client_id.as_str()),
         )
         .context(
             "TEAM Cognito client id is required; pass --client-id or set AWSP_TEAM_CLIENT_ID",
         )?;
-        let redirect_uri = option_or_env_or_state(
+        let redirect_uri = option_or_env_or_discovered_or_state(
             &options.redirect_uri,
             TEAM_REDIRECT_URI_ENV,
+            discovered
+                .as_ref()
+                .map(|config| config.redirect_uri.as_str()),
             current.as_ref().map(|team| team.redirect_uri.as_str()),
         )
         .context(
             "TEAM redirect URI is required; pass --redirect-uri or set AWSP_TEAM_REDIRECT_URI",
         )?;
-        let scopes = option_or_env_or_state(
+        let scopes = option_or_env_or_discovered_or_state(
             &options.scopes,
             TEAM_SCOPES_ENV,
+            discovered
+                .as_ref()
+                .and_then(|config| config.scopes.as_deref()),
             current.as_ref().map(|team| team.scopes.as_str()),
         )
         .unwrap_or_else(|| DEFAULT_TEAM_SCOPES.to_string());
@@ -368,6 +395,50 @@ impl TeamAuthConfig {
     fn token_endpoint(&self) -> String {
         format!("{}/oauth2/token", self.cognito_domain)
     }
+}
+
+fn discover_team_app_config(app_url: &str) -> Result<TeamAppConfig> {
+    let app_url = normalize_app_url(app_url);
+    let html = fetch_text(&app_url, "TEAM app HTML")?;
+    if let Some(config) = parse_team_app_config(&html)? {
+        return Ok(config);
+    }
+
+    for script in extract_script_sources(&html) {
+        let script_url = resolve_app_asset_url(&app_url, &script)
+            .with_context(|| format!("failed to resolve TEAM app script {script}"))?;
+        let javascript = fetch_text(&script_url, "TEAM app JavaScript")?;
+        if let Some(config) = parse_team_app_config(&javascript)? {
+            return Ok(config);
+        }
+    }
+
+    bail!(
+        "could not discover TEAM config from {app_url}; pass --endpoint, --domain, --client-id, and --redirect-uri explicitly"
+    )
+}
+
+fn parse_team_app_config(source: &str) -> Result<Option<TeamAppConfig>> {
+    let graphql_endpoint = match extract_js_string_field(source, "aws_appsync_graphqlEndpoint") {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let client_id = extract_js_string_field(source, "aws_user_pools_web_client_id")
+        .context("TEAM app config missing aws_user_pools_web_client_id")?;
+    let oauth = oauth_config_window(source).unwrap_or(source);
+    let cognito_domain =
+        extract_js_string_field(oauth, "domain").context("TEAM app config missing oauth.domain")?;
+    let redirect_uri = extract_js_string_field(oauth, "redirectSignIn")
+        .context("TEAM app config missing oauth.redirectSignIn")?;
+    let scopes = extract_js_scope_field(oauth);
+
+    Ok(Some(TeamAppConfig {
+        graphql_endpoint,
+        cognito_domain,
+        client_id,
+        redirect_uri,
+        scopes,
+    }))
 }
 
 impl TeamIdentity {
@@ -633,14 +704,16 @@ fn collect_request_input(
     })
 }
 
-fn option_or_env_or_state(
+fn option_or_env_or_discovered_or_state(
     value: &Option<String>,
     env_name: &str,
+    discovered_value: Option<&str>,
     state_value: Option<&str>,
 ) -> Option<String> {
     value
         .clone()
         .or_else(|| env::var(env_name).ok())
+        .or_else(|| discovered_value.map(str::to_string))
         .or_else(|| state_value.map(str::to_string))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -653,6 +726,186 @@ fn normalize_cognito_domain(value: &str) -> String {
     } else {
         format!("https://{trimmed}")
     }
+}
+
+fn normalize_app_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
+fn fetch_text(url: &str, label: &str) -> Result<String> {
+    let output = Command::new("curl")
+        .args(["-fsSL", "--max-time", "30", url])
+        .output()
+        .with_context(|| format!("failed to run curl for {label}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("failed to fetch {label} from {url}: {stderr}");
+    }
+
+    String::from_utf8(output.stdout).with_context(|| format!("{label} was not valid UTF-8"))
+}
+
+fn extract_script_sources(html: &str) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mut rest = html;
+    while let Some(index) = rest.find("src=") {
+        rest = &rest[index + "src=".len()..];
+        let Some(quote) = rest.as_bytes().first().copied() else {
+            break;
+        };
+        if quote != b'"' && quote != b'\'' {
+            continue;
+        }
+        rest = &rest[1..];
+        let Some(end) = rest.find(quote as char) else {
+            break;
+        };
+        let value = &rest[..end];
+        if value.contains(".js") {
+            sources.push(value.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    sources
+}
+
+fn resolve_app_asset_url(app_url: &str, asset: &str) -> Result<String> {
+    let asset = asset.trim();
+    if asset.starts_with("http://") || asset.starts_with("https://") {
+        return Ok(asset.to_string());
+    }
+
+    let scheme_end = app_url.find("://").context("app URL is missing a scheme")?;
+    let after_scheme = scheme_end + "://".len();
+    let path_start = app_url[after_scheme..]
+        .find('/')
+        .map(|index| after_scheme + index);
+    let origin = path_start.map(|index| &app_url[..index]).unwrap_or(app_url);
+
+    if asset.starts_with("//") {
+        return Ok(format!("{}:{asset}", &app_url[..scheme_end]));
+    }
+    if asset.starts_with('/') {
+        return Ok(format!("{origin}{asset}"));
+    }
+
+    let base = if app_url.ends_with('/') {
+        app_url.to_string()
+    } else if let Some(index) = app_url.rfind('/') {
+        if index >= after_scheme {
+            app_url[..=index].to_string()
+        } else {
+            format!("{origin}/")
+        }
+    } else {
+        format!("{origin}/")
+    };
+    Ok(format!("{base}{asset}"))
+}
+
+fn oauth_config_window(source: &str) -> Option<&str> {
+    let config_start = source.find("aws_appsync_graphqlEndpoint")?;
+    let start = config_start + source[config_start..].find("oauth")?;
+    let end = (start + 1_500).min(source.len());
+    Some(&source[start..end])
+}
+
+fn extract_js_string_field(source: &str, key: &str) -> Option<String> {
+    let mut offset = 0;
+    while let Some(index) = source[offset..].find(key) {
+        let start = offset + index;
+        let mut after_key = source[start + key.len()..].trim_start();
+        if after_key.starts_with('"') || after_key.starts_with('\'') {
+            after_key = after_key[1..].trim_start();
+        }
+        let Some(after_colon) = after_key.strip_prefix(':') else {
+            offset = start + key.len();
+            continue;
+        };
+        if let Some(value) = read_js_string(after_colon.trim_start()) {
+            return Some(value);
+        }
+        offset = start + key.len();
+    }
+    None
+}
+
+fn extract_js_scope_field(source: &str) -> Option<String> {
+    let index = source.find("scope")?;
+    let mut after_key = source[index + "scope".len()..].trim_start();
+    if after_key.starts_with('"') || after_key.starts_with('\'') {
+        after_key = after_key[1..].trim_start();
+    }
+    let after_colon = after_key.strip_prefix(':')?.trim_start();
+    if let Some(value) = read_js_string(after_colon) {
+        return Some(value);
+    }
+
+    let array = after_colon.strip_prefix('[')?;
+    let end = array.find(']')?;
+    let mut scopes = Vec::new();
+    let mut rest = &array[..end];
+    while let Some(index) = rest.find(|char| char == '"' || char == '\'') {
+        rest = &rest[index..];
+        let quote = rest.as_bytes().first().copied()?;
+        let mut value = String::new();
+        let mut escaped = false;
+        let mut consumed = None;
+        for (offset, char) in rest[1..].char_indices() {
+            if escaped {
+                value.push(char);
+                escaped = false;
+                continue;
+            }
+            if char == '\\' {
+                escaped = true;
+                continue;
+            }
+            if char as u8 == quote {
+                consumed = Some(offset + 2);
+                break;
+            }
+            value.push(char);
+        }
+        scopes.push(value);
+        rest = &rest[consumed?..];
+    }
+    if scopes.is_empty() {
+        None
+    } else {
+        Some(scopes.join(" "))
+    }
+}
+
+fn read_js_string(source: &str) -> Option<String> {
+    let quote = source.as_bytes().first().copied()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+
+    let mut output = String::new();
+    let mut escaped = false;
+    for char in source[1..].chars() {
+        if escaped {
+            output.push(char);
+            escaped = false;
+            continue;
+        }
+        if char == '\\' {
+            escaped = true;
+            continue;
+        }
+        if char as u8 == quote {
+            return Some(output);
+        }
+        output.push(char);
+    }
+    None
 }
 
 fn code_verifier() -> String {
@@ -1063,5 +1316,57 @@ mod tests {
             Some("good")
         )
         .is_err());
+    }
+
+    #[test]
+    fn discovers_team_config_from_minified_amplify_bundle() {
+        let javascript = r#"
+            var Fo={aws_project_region:"us-east-1",
+            aws_appsync_graphqlEndpoint:"https://example.appsync-api.us-east-1.amazonaws.com/graphql",
+            aws_appsync_region:"us-east-1",
+            aws_user_pools_web_client_id:"client-123",
+            oauth:{domain:"team.auth.us-east-1.amazoncognito.com",
+            scope:["phone","email","openid","profile","aws.cognito.signin.user.admin"],
+            redirectSignIn:"https://team.example.com/",
+            redirectSignOut:"https://team.example.com/",responseType:"code"}};
+        "#;
+
+        let config = parse_team_app_config(javascript).unwrap().unwrap();
+
+        assert_eq!(
+            config.graphql_endpoint,
+            "https://example.appsync-api.us-east-1.amazonaws.com/graphql"
+        );
+        assert_eq!(
+            config.cognito_domain,
+            "team.auth.us-east-1.amazoncognito.com"
+        );
+        assert_eq!(config.client_id, "client-123");
+        assert_eq!(config.redirect_uri, "https://team.example.com/");
+        assert_eq!(
+            config.scopes.unwrap(),
+            "phone email openid profile aws.cognito.signin.user.admin"
+        );
+    }
+
+    #[test]
+    fn extracts_and_resolves_team_app_scripts() {
+        let html = r#"
+            <script defer="defer" src="/static/js/main.abc123.js"></script>
+            <script src="runtime.js"></script>
+        "#;
+
+        assert_eq!(
+            extract_script_sources(html),
+            vec!["/static/js/main.abc123.js", "runtime.js"]
+        );
+        assert_eq!(
+            resolve_app_asset_url("https://team.example.com/app/", "/static/js/main.js").unwrap(),
+            "https://team.example.com/static/js/main.js"
+        );
+        assert_eq!(
+            resolve_app_asset_url("https://team.example.com/app/index.html", "runtime.js").unwrap(),
+            "https://team.example.com/app/runtime.js"
+        );
     }
 }

@@ -36,6 +36,7 @@ awsp status                  # show local SSO cache status
 awsp login prod-admin        # run aws sso login for a profile
 awsp off                     # clear AWS_PROFILE in this shell
 awsp exec prod-admin -- aws s3 ls
+awsp team login --app-url https://team.example.com
 awsp doctor                  # check AWS CLI, config, and profile diagnostics
 ```
 
