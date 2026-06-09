@@ -43,7 +43,8 @@ f3d2090ccee044bf734164a067c221053f2aff41db534e6edfd590bcca5cc0d6
 Install from another machine:
 
 ```sh
-brew install arseniizakharov/awsp/awsp
+brew tap arseniizakharov/awsp
+brew install awsp
 ```
 
 ## Local Formula Check

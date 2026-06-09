@@ -11,7 +11,8 @@ AWS credentials. Login, logout, and token caching stay owned by the AWS CLI.
 Install from the Homebrew tap:
 
 ```sh
-brew install arseniizakharov/awsp/awsp
+brew tap arseniizakharov/awsp
+brew install awsp
 awsp setup zsh   # or: awsp setup bash
 ```
 
