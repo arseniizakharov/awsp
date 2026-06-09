@@ -704,27 +704,11 @@ impl TeamClient {
         target: &RequestTarget,
         input: &RequestInput,
     ) -> Result<ElevationOutcome> {
-        let mut request_input = json!({
-            "accountId": target.account_id,
-            "accountName": target.account_name,
-            "role": target.role_name,
-            "roleId": target.role_id,
-            "startTime": Utc::now().to_rfc3339(),
-            "duration": input.duration_hours,
-            "justification": input.justification,
-            "ticketNo": input.ticket_no,
-        });
-        if let Some(email) = self.config.requester_email() {
-            if let Some(object) = request_input.as_object_mut() {
-                object.insert("email".to_string(), json!(email));
-            }
-        }
-
         let data = self.call_graphql_with_token(
             self.config.create_token(),
             CREATE_REQUEST,
             json!({
-                "input": request_input
+                "input": create_request_input(target, input, Utc::now().to_rfc3339())
             }),
         )?;
         let request = data
@@ -802,6 +786,19 @@ struct RequestInput {
     duration_hours: String,
     ticket_no: String,
     justification: String,
+}
+
+fn create_request_input(target: &RequestTarget, input: &RequestInput, start_time: String) -> Value {
+    json!({
+        "accountId": target.account_id,
+        "accountName": target.account_name,
+        "role": target.role_name,
+        "roleId": target.role_id,
+        "startTime": start_time,
+        "duration": input.duration_hours,
+        "justification": input.justification,
+        "ticketNo": input.ticket_no,
+    })
 }
 
 fn collect_request_input(
@@ -1838,6 +1835,39 @@ mod tests {
             Some("user@example.com".to_string())
         );
         assert_eq!(config.create_token(), token);
+    }
+
+    #[test]
+    fn builds_create_request_input_like_team_browser_form() {
+        let target = RequestTarget {
+            account_id: "111122223333".to_string(),
+            account_name: "prod".to_string(),
+            role_name: "Admin".to_string(),
+            role_id: "arn:aws:sso:::permissionSet/ssoins-1/ps-1".to_string(),
+            max_duration: Some("3".to_string()),
+        };
+        let input = RequestInput {
+            duration_hours: "2".to_string(),
+            ticket_no: "1234".to_string(),
+            justification: "deploy".to_string(),
+        };
+
+        let value = create_request_input(&target, &input, "2026-06-09T12:00:00Z".to_string());
+
+        assert_eq!(
+            value,
+            json!({
+                "accountId": "111122223333",
+                "accountName": "prod",
+                "role": "Admin",
+                "roleId": "arn:aws:sso:::permissionSet/ssoins-1/ps-1",
+                "startTime": "2026-06-09T12:00:00Z",
+                "duration": "2",
+                "justification": "deploy",
+                "ticketNo": "1234",
+            })
+        );
+        assert!(value.get("email").is_none());
     }
 
     #[test]
