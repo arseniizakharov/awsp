@@ -56,7 +56,25 @@ const CREATE_REQUEST: &str = r#"
 mutation CreateRequests($input: CreateRequestsInput!) {
   createRequests(input: $input) {
     id
+    email
     status
+  }
+}
+"#;
+
+const REQUESTS_BY_EMAIL: &str = r#"
+query RequestByEmailAndStatus(
+  $email: String!
+  $status: ModelStringKeyConditionInput
+  $limit: Int
+) {
+  requestByEmailAndStatus(email: $email, status: $status, limit: $limit) {
+    items {
+      id
+      accountId
+      role
+      status
+    }
   }
 }
 "#;
@@ -87,6 +105,7 @@ pub struct TeamLoginOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElevationOutcome {
     Submitted { id: String, status: String },
+    ExistingPending { id: String, status: String },
     NotConfigured,
     Declined,
 }
@@ -94,7 +113,8 @@ pub enum ElevationOutcome {
 #[derive(Debug, Clone)]
 struct TeamConfig {
     endpoint: String,
-    token: String,
+    access_token: String,
+    id_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +176,9 @@ pub fn request_access(
     let client = TeamClient::new(config);
     let identity = client.resolve_identity()?;
     let target = client.resolve_request_target(profile, &identity)?;
+    if let Some(existing) = client.find_pending_request(&target)? {
+        return Ok(existing);
+    }
     let input = collect_request_input(profile, &target, options)?;
 
     if !options.yes {
@@ -311,10 +334,11 @@ impl TeamConfig {
         let Some(team) = state::get_team_state()? else {
             return Ok(None);
         };
-        if token_is_fresh(&team.access_token) {
+        if token_is_fresh(&team.access_token) && token_is_fresh(&team.id_token) {
             return Ok(Some(Self {
                 endpoint: team.graphql_endpoint,
-                token: team.access_token,
+                access_token: team.access_token,
+                id_token: Some(team.id_token),
             }));
         }
 
@@ -322,11 +346,15 @@ impl TeamConfig {
             return Ok(None);
         };
         let auth = TeamAuthConfig::from_state(&team);
-        let tokens = refresh_tokens(&auth, &refresh_token)?;
+        let mut tokens = refresh_tokens(&auth, &refresh_token)?;
+        if tokens.refresh_token.is_none() {
+            tokens.refresh_token = Some(refresh_token);
+        }
         persist_team_state(&auth, tokens.clone())?;
         Ok(Some(Self {
             endpoint: auth.graphql_endpoint,
-            token: tokens.access_token,
+            access_token: tokens.access_token,
+            id_token: Some(tokens.id_token),
         }))
     }
 
@@ -340,7 +368,21 @@ impl TeamConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())?;
 
-        Some(Self { endpoint, token })
+        Some(Self {
+            endpoint,
+            access_token: token,
+            id_token: None,
+        })
+    }
+
+    fn create_token(&self) -> &str {
+        self.id_token.as_deref().unwrap_or(&self.access_token)
+    }
+
+    fn requester_email(&self) -> Option<String> {
+        self.id_token
+            .as_deref()
+            .and_then(|token| jwt_string_claim(token, "email"))
     }
 }
 
@@ -551,7 +593,7 @@ impl TeamClient {
     }
 
     fn resolve_identity(&self) -> Result<TeamIdentity> {
-        if let Ok(identity) = TeamIdentity::from_jwt(&self.config.token) {
+        if let Ok(identity) = TeamIdentity::from_jwt(&self.config.access_token) {
             return Ok(identity);
         }
 
@@ -622,24 +664,67 @@ impl TeamClient {
         );
     }
 
+    fn find_pending_request(&self, target: &RequestTarget) -> Result<Option<ElevationOutcome>> {
+        let Some(email) = self.config.requester_email() else {
+            return Ok(None);
+        };
+        let data = self.call_graphql_with_token(
+            self.config.create_token(),
+            REQUESTS_BY_EMAIL,
+            json!({
+                "email": email,
+                "status": { "eq": "pending" },
+                "limit": 50,
+            }),
+        )?;
+        let requests = data
+            .get("requestByEmailAndStatus")
+            .and_then(|value| value.get("items"))
+            .and_then(Value::as_array)
+            .context("TEAM requestByEmailAndStatus response missing items")?;
+
+        for request in requests {
+            let is_target = request.get("accountId").and_then(Value::as_str)
+                == Some(target.account_id.as_str())
+                && request.get("role").and_then(Value::as_str) == Some(target.role_name.as_str());
+            let is_pending = request.get("status").and_then(Value::as_str) == Some("pending");
+            if is_target && is_pending {
+                return Ok(Some(ElevationOutcome::ExistingPending {
+                    id: required_string(request, "id")?,
+                    status: "pending".to_string(),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn create_request(
         &self,
         target: &RequestTarget,
         input: &RequestInput,
     ) -> Result<ElevationOutcome> {
-        let data = self.call_graphql(
+        let mut request_input = json!({
+            "accountId": target.account_id,
+            "accountName": target.account_name,
+            "role": target.role_name,
+            "roleId": target.role_id,
+            "startTime": Utc::now().to_rfc3339(),
+            "duration": input.duration_hours,
+            "justification": input.justification,
+            "ticketNo": input.ticket_no,
+        });
+        if let Some(email) = self.config.requester_email() {
+            if let Some(object) = request_input.as_object_mut() {
+                object.insert("email".to_string(), json!(email));
+            }
+        }
+
+        let data = self.call_graphql_with_token(
+            self.config.create_token(),
             CREATE_REQUEST,
             json!({
-                "input": {
-                    "accountId": target.account_id,
-                    "accountName": target.account_name,
-                    "role": target.role_name,
-                    "roleId": target.role_id,
-                    "startTime": Utc::now().to_rfc3339(),
-                    "duration": input.duration_hours,
-                    "justification": input.justification,
-                    "ticketNo": input.ticket_no,
-                }
+                "input": request_input
             }),
         )?;
         let request = data
@@ -656,6 +741,10 @@ impl TeamClient {
     }
 
     fn call_graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.call_graphql_with_token(&self.config.access_token, query, variables)
+    }
+
+    fn call_graphql_with_token(&self, token: &str, query: &str, variables: Value) -> Result<Value> {
         let payload = json!({
             "query": query,
             "variables": variables,
@@ -670,7 +759,7 @@ impl TeamClient {
                 "-H",
                 "content-type: application/json",
                 "-H",
-                &format!("Authorization: {}", self.config.token),
+                &format!("Authorization: {token}"),
                 "--data-binary",
                 "@-",
                 &self.config.endpoint,
@@ -1142,10 +1231,18 @@ fn token_status(token: &str) -> Option<String> {
 }
 
 fn token_exp(token: &str) -> Option<i64> {
+    let value = jwt_payload(token)?;
+    value.get("exp").and_then(Value::as_i64)
+}
+
+fn jwt_string_claim(token: &str, field: &str) -> Option<String> {
+    jwt_payload(token)?.get(field)?.as_str().map(str::to_string)
+}
+
+fn jwt_payload(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let decoded = decode_base64_url(payload).ok()?;
-    let value = serde_json::from_slice::<Value>(&decoded).ok()?;
-    value.get("exp").and_then(Value::as_i64)
+    serde_json::from_slice::<Value>(&decoded).ok()
 }
 
 struct BrowserCaptureSession {
@@ -1720,6 +1817,27 @@ mod tests {
 
         assert_eq!(identity.user_id, "u-1");
         assert_eq!(identity.group_ids, vec!["g-1", "g-2"]);
+    }
+
+    #[test]
+    fn extracts_requester_email_from_id_token() {
+        let payload = base64_url_encode(br#"{"email":"user@example.com","exp":4102444800}"#);
+        let token = format!("e30.{payload}.");
+        let config = TeamConfig {
+            endpoint: "https://example.appsync-api.us-east-1.amazonaws.com/graphql".to_string(),
+            access_token: "access-token".to_string(),
+            id_token: Some(token.clone()),
+        };
+
+        assert_eq!(
+            jwt_string_claim(&token, "email"),
+            Some("user@example.com".to_string())
+        );
+        assert_eq!(
+            config.requester_email(),
+            Some("user@example.com".to_string())
+        );
+        assert_eq!(config.create_token(), token);
     }
 
     #[test]

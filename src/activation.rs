@@ -81,6 +81,10 @@ pub fn request_elevation(profile_name: &str, options: ElevationOptions) -> Resul
             eprintln!("TEAM request submitted: {id} ({status})");
             Ok(())
         }
+        ElevationOutcome::ExistingPending { id, status } => {
+            eprintln!("TEAM request already exists: {id} ({status})");
+            Ok(())
+        }
         ElevationOutcome::NotConfigured => {
             bail!("TEAM request submission is not configured")
         }
@@ -320,6 +324,14 @@ fn request_missing_assignment(
     match elevation::request_access(profile, elevation_options)? {
         ElevationOutcome::Submitted { id, status } => {
             eprintln!("  TEAM request submitted: {id} ({status}).");
+            eprintln!(
+                "  Activate {} again after access becomes active.",
+                profile.name
+            );
+            Ok(false)
+        }
+        ElevationOutcome::ExistingPending { id, status } => {
+            eprintln!("  TEAM request already pending: {id} ({status}).");
             eprintln!(
                 "  Activate {} again after access becomes active.",
                 profile.name
