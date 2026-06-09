@@ -62,6 +62,20 @@ mutation CreateRequests($input: CreateRequestsInput!) {
 }
 "#;
 
+const GET_REQUEST: &str = r#"
+query GetRequests($id: ID!) {
+  getRequests(id: $id) {
+    id
+    email
+    username
+    status
+    approvers
+    approver_ids
+    session_duration
+  }
+}
+"#;
+
 const REQUESTS_BY_EMAIL: &str = r#"
 query RequestByEmailAndStatus(
   $email: String!
@@ -295,6 +309,12 @@ pub fn team_status() -> Result<()> {
         "TEAM ID token: {}",
         token_status(&team.id_token).unwrap_or_else(|| "unknown".to_string())
     );
+    print_team_token_claims("TEAM ID token claims", &team.id_token);
+    println!(
+        "TEAM access token: {}",
+        token_status(&team.access_token).unwrap_or_else(|| "unknown".to_string())
+    );
+    print_team_token_claims("TEAM access token claims", &team.access_token);
     println!(
         "TEAM refresh token: {}",
         if team.refresh_token.is_some() {
@@ -376,6 +396,16 @@ impl TeamConfig {
     }
 
     fn create_token(&self) -> &str {
+        if let Some(token) = self
+            .id_token
+            .as_deref()
+            .filter(|token| token_has_team_router_username(token))
+        {
+            return token;
+        }
+        if token_has_team_router_username(&self.access_token) {
+            return &self.access_token;
+        }
         self.id_token.as_deref().unwrap_or(&self.access_token)
     }
 
@@ -383,6 +413,10 @@ impl TeamConfig {
         self.id_token
             .as_deref()
             .and_then(|token| jwt_string_claim(token, "email"))
+    }
+
+    fn create_token_claim_summary(&self) -> String {
+        team_token_claim_summary(self.create_token())
     }
 }
 
@@ -704,8 +738,15 @@ impl TeamClient {
         target: &RequestTarget,
         input: &RequestInput,
     ) -> Result<ElevationOutcome> {
+        let create_token = self.config.create_token();
+        if !token_has_team_router_username(create_token) {
+            bail!(
+                "TEAM login token does not expose an IDC_* username claim required by TEAM request workflow. Run `awsp team status` to inspect cached token claims, then use the TEAM UI for this request."
+            );
+        }
+
         let data = self.call_graphql_with_token(
-            self.config.create_token(),
+            create_token,
             CREATE_REQUEST,
             json!({
                 "input": create_request_input(target, input, Utc::now().to_rfc3339())
@@ -714,14 +755,52 @@ impl TeamClient {
         let request = data
             .get("createRequests")
             .context("TEAM createRequests response missing")?;
-        Ok(ElevationOutcome::Submitted {
-            id: required_string(request, "id")?,
-            status: request
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("pending")
-                .to_string(),
-        })
+        let id = required_string(request, "id")?;
+        let status = request
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+            .to_string();
+        let verified = self.wait_for_request_enrichment(&id)?;
+        if !request_is_enriched_for_team_ui(verified.as_ref()) {
+            let details = verified
+                .as_ref()
+                .map(created_request_debug_summary)
+                .unwrap_or_else(|| "request could not be read after create".to_string());
+            bail!(
+                "TEAM returned request id {id}, but the backend did not attach requester email/approvers, so the UI and workflow will not see it. {details}. Create token claims: {}. Use the TEAM UI for this request and run `awsp team status` to inspect cached token claims.",
+                self.config.create_token_claim_summary()
+            );
+        }
+        Ok(ElevationOutcome::Submitted { id, status })
+    }
+
+    fn wait_for_request_enrichment(&self, id: &str) -> Result<Option<Value>> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut last = None;
+
+        loop {
+            let request = self.get_request(id)?;
+            if request_is_enriched_for_team_ui(request.as_ref()) || Instant::now() >= deadline {
+                return Ok(request.or(last));
+            }
+            last = request;
+            thread::sleep(Duration::from_millis(750));
+        }
+    }
+
+    fn get_request(&self, id: &str) -> Result<Option<Value>> {
+        let data = self.call_graphql_with_token(
+            self.config.create_token(),
+            GET_REQUEST,
+            json!({
+                "id": id,
+            }),
+        )?;
+        Ok(data
+            .get("getRequests")
+            .cloned()
+            .filter(|value| !value.is_null()))
     }
 
     fn call_graphql(&self, query: &str, variables: Value) -> Result<Value> {
@@ -1240,6 +1319,154 @@ fn jwt_payload(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let decoded = decode_base64_url(payload).ok()?;
     serde_json::from_slice::<Value>(&decoded).ok()
+}
+
+fn print_team_token_claims(label: &str, token: &str) {
+    println!("{label}: {}", team_token_claim_summary(token));
+}
+
+fn team_token_claim_summary(token: &str) -> String {
+    let Some(payload) = jwt_payload(token) else {
+        return "unreadable".to_string();
+    };
+
+    let mut parts = Vec::new();
+    push_claim_part(&mut parts, "token_use", payload.get("token_use"));
+    push_claim_part(&mut parts, "email", payload.get("email"));
+    push_claim_part(&mut parts, "username", payload.get("username"));
+    push_claim_part(
+        &mut parts,
+        "cognito:username",
+        payload.get("cognito:username"),
+    );
+    push_claim_part(&mut parts, "userId", payload.get("userId"));
+    if let Some(group_ids) = group_ids_from_claim(payload.get("groupIds")) {
+        parts.push(format!("groupIds={}", group_ids.len()));
+    }
+
+    if parts.is_empty() {
+        "no relevant claims".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn push_claim_part(parts: &mut Vec<String>, name: &str, value: Option<&Value>) {
+    let Some(value) = value else {
+        return;
+    };
+    if let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) {
+        parts.push(format!("{name}={}", display_claim_value(name, value)));
+    }
+}
+
+fn display_claim_value(name: &str, value: &str) -> String {
+    match name {
+        "email" => redact_email(value),
+        "username" | "cognito:username" => redact_username(value),
+        "userId" => "<present>".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn redact_email(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return "<redacted>".to_string();
+    };
+    let Some(first) = local.chars().next() else {
+        return format!("***@{domain}");
+    };
+    format!("{first}***@{domain}")
+}
+
+fn redact_username(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some((prefix, rest)) = trimmed.split_once('_') {
+        if !prefix.is_empty() && !rest.is_empty() {
+            return format!("{prefix}_<redacted>");
+        }
+    }
+    "<redacted>".to_string()
+}
+
+fn token_has_team_router_username(token: &str) -> bool {
+    team_router_username_claim(token)
+        .as_deref()
+        .map(is_team_router_username)
+        .unwrap_or(false)
+}
+
+fn team_router_username_claim(token: &str) -> Option<String> {
+    jwt_string_claim(token, "cognito:username").or_else(|| jwt_string_claim(token, "username"))
+}
+
+fn is_team_router_username(value: &str) -> bool {
+    value
+        .get(..4)
+        .map(|prefix| prefix.eq_ignore_ascii_case("IDC_"))
+        .unwrap_or(false)
+        && value.len() > 4
+}
+
+fn request_is_enriched_for_team_ui(request: Option<&Value>) -> bool {
+    let Some(request) = request else {
+        return false;
+    };
+    let has_email = request
+        .get("email")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let has_approver = request
+        .get("approvers")
+        .and_then(Value::as_array)
+        .map(|values| !values.is_empty())
+        .unwrap_or(false)
+        || request
+            .get("approver_ids")
+            .and_then(Value::as_array)
+            .map(|values| !values.is_empty())
+            .unwrap_or(false);
+
+    has_email && has_approver
+}
+
+fn created_request_debug_summary(request: &Value) -> String {
+    let id = request
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let status = request
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let email = request
+        .get("email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(redact_email)
+        .unwrap_or_else(|| "<missing>".to_string());
+    let username = request
+        .get("username")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(redact_username)
+        .unwrap_or_else(|| "<missing>".to_string());
+    let approvers = request
+        .get("approvers")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let approver_ids = request
+        .get("approver_ids")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    format!(
+        "Created record: id={id}, status={status}, email={email}, username={username}, approvers={approvers}, approver_ids={approver_ids}"
+    )
 }
 
 struct BrowserCaptureSession {
@@ -1835,6 +2062,87 @@ mod tests {
             Some("user@example.com".to_string())
         );
         assert_eq!(config.create_token(), token);
+    }
+
+    #[test]
+    fn create_token_prefers_token_with_idc_username() {
+        let id_payload = base64_url_encode(br#"{"email":"user@example.com","exp":4102444800}"#);
+        let id_token = format!("e30.{id_payload}.");
+        let access_payload =
+            base64_url_encode(br#"{"username":"IDC_user@example.com","exp":4102444800}"#);
+        let access_token = format!("e30.{access_payload}.");
+        let config = TeamConfig {
+            endpoint: "https://example.appsync-api.us-east-1.amazonaws.com/graphql".to_string(),
+            access_token: access_token.clone(),
+            id_token: Some(id_token),
+        };
+
+        assert_eq!(config.create_token(), access_token);
+    }
+
+    #[test]
+    fn detects_team_router_username_claims() {
+        let payload =
+            base64_url_encode(br#"{"cognito:username":"IDC_user@example.com","exp":4102444800}"#);
+        let token = format!("e30.{payload}.");
+        let wrong_payload =
+            base64_url_encode(br#"{"cognito:username":"user@example.com","exp":4102444800}"#);
+        let wrong_token = format!("e30.{wrong_payload}.");
+
+        assert!(token_has_team_router_username(&token));
+        assert!(!token_has_team_router_username(&wrong_token));
+    }
+
+    #[test]
+    fn summarizes_team_token_claims_without_raw_token() {
+        let payload = base64_url_encode(
+            br#"{"token_use":"id","email":"user@example.com","cognito:username":"IDC_user@example.com","userId":"u-1","groupIds":["g-1","g-2"],"exp":4102444800}"#,
+        );
+        let token = format!("e30.{payload}.");
+
+        assert_eq!(
+            team_token_claim_summary(&token),
+            "token_use=id, email=u***@example.com, cognito:username=IDC_<redacted>, userId=<present>, groupIds=2"
+        );
+    }
+
+    #[test]
+    fn treats_email_and_approvers_as_created_request_enrichment() {
+        assert!(request_is_enriched_for_team_ui(Some(&json!({
+            "id": "request-1",
+            "email": "user@example.com",
+            "approvers": ["approver@example.com"],
+            "approver_ids": [],
+        }))));
+        assert!(!request_is_enriched_for_team_ui(Some(&json!({
+            "id": "request-1",
+            "email": null,
+            "approvers": ["approver@example.com"],
+            "approver_ids": [],
+        }))));
+        assert!(!request_is_enriched_for_team_ui(Some(&json!({
+            "id": "request-1",
+            "email": "user@example.com",
+            "approvers": [],
+            "approver_ids": [],
+        }))));
+    }
+
+    #[test]
+    fn redacts_created_request_debug_summary() {
+        let summary = created_request_debug_summary(&json!({
+            "id": "request-1",
+            "status": "pending",
+            "email": "user@example.com",
+            "username": "IDC_user@example.com",
+            "approvers": ["approver@example.com"],
+            "approver_ids": ["approver-id"],
+        }));
+
+        assert_eq!(
+            summary,
+            "Created record: id=request-1, status=pending, email=u***@example.com, username=IDC_<redacted>, approvers=1, approver_ids=1"
+        );
     }
 
     #[test]
