@@ -31,15 +31,23 @@ const DEFAULT_JUSTIFICATION_ENV: &str = "AWSP_ELEVATE_JUSTIFICATION";
 const DEFAULT_TEAM_SCOPES: &str = "aws.cognito.signin.user.admin email openid phone profile";
 const DEFAULT_TEAM_IDP_IDENTIFIER: &str = "team";
 
-const GET_USER_POLICY: &str = r#"
-query GetUserPolicy($userId: String, $groupIds: [String]) {
-  getUserPolicy(userId: $userId, groupIds: $groupIds) {
-    policy {
-      accounts { name id }
-      permissions { name id }
-      approvalRequired
-      duration
-    }
+const GET_GROUPS: &str = r#"
+query GetGroups {
+  getGroups {
+    groups
+    userId
+    groupIds
+  }
+}
+"#;
+
+const GET_ENTITLEMENT: &str = r#"
+query GetEntitlement($userId: String, $groupIds: [String]) {
+  getEntitlement(userId: $userId, groupIds: $groupIds) {
+    accounts { name id }
+    permissions { name id }
+    approvalRequired
+    duration
   }
 }
 "#;
@@ -154,8 +162,8 @@ pub fn request_access(
         return Ok(ElevationOutcome::NotConfigured);
     };
 
-    let identity = TeamIdentity::from_jwt(&config.token)?;
     let client = TeamClient::new(config);
+    let identity = client.resolve_identity()?;
     let target = client.resolve_request_target(profile, &identity)?;
     let input = collect_request_input(profile, &target, options)?;
 
@@ -313,10 +321,10 @@ impl TeamConfig {
         let Some(team) = state::get_team_state()? else {
             return Ok(None);
         };
-        if token_is_fresh(&team.id_token) {
+        if token_is_fresh(&team.access_token) {
             return Ok(Some(Self {
                 endpoint: team.graphql_endpoint,
-                token: team.id_token,
+                token: team.access_token,
             }));
         }
 
@@ -328,7 +336,7 @@ impl TeamConfig {
         persist_team_state(&auth, tokens.clone())?;
         Ok(Some(Self {
             endpoint: auth.graphql_endpoint,
-            token: tokens.id_token,
+            token: tokens.access_token,
         }))
     }
 
@@ -530,11 +538,38 @@ impl TeamIdentity {
 
         Ok(Self { user_id, group_ids })
     }
+
+    fn from_get_groups_response(value: &Value) -> Result<Self> {
+        let user_id = value
+            .get("userId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("TEAM getGroups response did not contain userId")?;
+        let group_ids = group_ids_from_claim(value.get("groupIds"))
+            .context("TEAM getGroups response did not contain groupIds")?;
+        if group_ids.is_empty() {
+            bail!("TEAM getGroups response contains no groupIds");
+        }
+
+        Ok(Self { user_id, group_ids })
+    }
 }
 
 impl TeamClient {
     fn new(config: TeamConfig) -> Self {
         Self { config }
+    }
+
+    fn resolve_identity(&self) -> Result<TeamIdentity> {
+        if let Ok(identity) = TeamIdentity::from_jwt(&self.config.token) {
+            return Ok(identity);
+        }
+
+        let data = self.call_graphql(GET_GROUPS, json!({}))?;
+        let groups = data
+            .get("getGroups")
+            .context("TEAM getGroups response missing")?;
+        TeamIdentity::from_get_groups_response(groups)
     }
 
     fn resolve_request_target(
@@ -543,17 +578,16 @@ impl TeamClient {
         identity: &TeamIdentity,
     ) -> Result<RequestTarget> {
         let data = self.call_graphql(
-            GET_USER_POLICY,
+            GET_ENTITLEMENT,
             json!({
                 "userId": identity.user_id,
                 "groupIds": identity.group_ids,
             }),
         )?;
         let policy = data
-            .get("getUserPolicy")
-            .and_then(|value| value.get("policy"))
+            .get("getEntitlement")
             .and_then(Value::as_array)
-            .context("TEAM policy response did not include policy")?;
+            .context("TEAM entitlement response did not include getEntitlement")?;
 
         for entitlement in policy {
             let Some(account) = entitlement
@@ -1711,6 +1745,19 @@ mod tests {
         let groups = group_ids_from_claim(Some(&json!(["g-1", "g-2"]))).unwrap();
 
         assert_eq!(groups, vec!["g-1", "g-2"]);
+    }
+
+    #[test]
+    fn decodes_team_identity_from_get_groups_response() {
+        let identity = TeamIdentity::from_get_groups_response(&json!({
+            "userId": "u-1",
+            "groupIds": ["g-1", "g-2"],
+            "groups": ["Admins"],
+        }))
+        .unwrap();
+
+        assert_eq!(identity.user_id, "u-1");
+        assert_eq!(identity.group_ids, vec!["g-1", "g-2"]);
     }
 
     #[test]

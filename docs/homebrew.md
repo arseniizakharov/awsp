@@ -13,7 +13,7 @@ Homebrew maps the tap name `arseniizakharov/formulae` to the repository
 Tag the app repo:
 
 ```sh
-git tag -a v1.0.4 -m "v1.0.4"
+git tag -a v1.0.5 -m "v1.0.5"
 git push origin main --tags
 ```
 
@@ -21,11 +21,11 @@ Build and package the Apple Silicon macOS binary:
 
 ```sh
 cargo build --release --target aarch64-apple-darwin
-mkdir -p /tmp/awsp-v1.0.4-aarch64-apple-darwin
-install -m 0755 target/aarch64-apple-darwin/release/awsp /tmp/awsp-v1.0.4-aarch64-apple-darwin/awsp
-COPYFILE_DISABLE=1 tar -czf /tmp/awsp-v1.0.4-aarch64-apple-darwin.tar.gz -C /tmp awsp-v1.0.4-aarch64-apple-darwin
-shasum -a 256 /tmp/awsp-v1.0.4-aarch64-apple-darwin.tar.gz
-gh release upload v1.0.4 /tmp/awsp-v1.0.4-aarch64-apple-darwin.tar.gz --repo arseniizakharov/awsp
+mkdir -p /tmp/awsp-v1.0.5-aarch64-apple-darwin
+install -m 0755 target/aarch64-apple-darwin/release/awsp /tmp/awsp-v1.0.5-aarch64-apple-darwin/awsp
+COPYFILE_DISABLE=1 tar -czf /tmp/awsp-v1.0.5-aarch64-apple-darwin.tar.gz -C /tmp awsp-v1.0.5-aarch64-apple-darwin
+shasum -a 256 /tmp/awsp-v1.0.5-aarch64-apple-darwin.tar.gz
+gh release upload v1.0.5 /tmp/awsp-v1.0.5-aarch64-apple-darwin.tar.gz --repo arseniizakharov/awsp
 ```
 
 Copy `packaging/homebrew/awsp.rb` into the tap repo as:
@@ -34,10 +34,10 @@ Copy `packaging/homebrew/awsp.rb` into the tap repo as:
 Formula/awsp.rb
 ```
 
-The `v1.0.4` Apple Silicon binary checksum is:
+The `v1.0.5` Apple Silicon binary checksum is:
 
 ```text
-2f21435c721dbba6b34deb679c0ade142c6a40e9dabdbdda188e4da85a7f3e30
+71581dc40527955e5e321ea8c8d07eabda16c8262ca1acc4b472249fcd5fa97b
 ```
 
 Install from another machine:
