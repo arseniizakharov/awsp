@@ -40,6 +40,10 @@ awsp team login --app-url https://team.example.com
 awsp doctor                  # check AWS CLI, config, and profile diagnostics
 ```
 
+For TEAM login, `--app-url` discovers the deployed app config. If TEAM's
+Cognito app client has a localhost callback registered, pass it with
+`--redirect-uri` and `awsp` will capture the browser redirect automatically.
+
 `awsp` reads `AWS_CONFIG_FILE` when set, otherwise `~/.aws/config`. Run
 `aws configure sso` first; incomplete SSO profiles are hidden from normal
 commands and reported by `awsp doctor`.

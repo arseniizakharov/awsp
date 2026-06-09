@@ -6,8 +6,10 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 use uuid::Uuid;
 
 const TEAM_ENDPOINT_ENV: &str = "AWSP_TEAM_GRAPHQL_ENDPOINT";
@@ -108,6 +110,12 @@ struct TeamAppConfig {
     scopes: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoopbackRedirectUri {
+    bind_host: String,
+    port: u16,
+}
+
 #[derive(Debug, Clone)]
 struct TokenResponse {
     id_token: String,
@@ -164,9 +172,23 @@ pub fn team_login(options: TeamLoginOptions) -> Result<()> {
     let challenge = code_challenge(&verifier);
     let state_value = Uuid::new_v4().to_string();
     let authorize_url = auth.authorize_url(&challenge, &state_value);
+    let callback_listener = if options.code.is_none() && options.redirected_url.is_none() {
+        bind_loopback_callback(&auth.redirect_uri)?
+    } else {
+        None
+    };
+    let has_callback_listener = callback_listener.is_some();
 
     eprintln!("Open this TEAM sign-in URL:");
     eprintln!("{authorize_url}");
+    if has_callback_listener {
+        eprintln!(
+            "Waiting for Cognito to redirect back to {}.",
+            auth.redirect_uri
+        );
+    } else {
+        explain_web_app_redirect_if_needed(&options, &auth);
+    }
     if !options.no_open {
         open_browser(&authorize_url);
     }
@@ -175,14 +197,11 @@ pub fn team_login(options: TeamLoginOptions) -> Result<()> {
         (Some(code), _) => code.trim().to_string(),
         (_, Some(url)) => extract_authorization_code(url, Some(&state_value))?,
         (None, None) => {
-            let pasted = prompt::text("Paste final redirected URL or code:", None)?;
-            extract_authorization_code(&pasted, Some(&state_value)).or_else(|_| {
-                if pasted.trim().is_empty() {
-                    bail!("authorization code is required")
-                } else {
-                    Ok(pasted.trim().to_string())
-                }
-            })?
+            if let Some(listener) = callback_listener {
+                wait_for_loopback_code(listener, &state_value)?
+            } else {
+                prompt_for_authorization_code(&state_value)?
+            }
         }
     };
 
@@ -190,6 +209,39 @@ pub fn team_login(options: TeamLoginOptions) -> Result<()> {
     persist_team_state(&auth, tokens)?;
     eprintln!("TEAM login cached.");
     Ok(())
+}
+
+fn prompt_for_authorization_code(expected_state: &str) -> Result<String> {
+    let pasted = prompt::text("Paste final redirected URL or code:", None)?;
+    extract_authorization_code(&pasted, Some(expected_state)).or_else(|_| {
+        if pasted.trim().is_empty() {
+            bail!("authorization code is required")
+        } else {
+            Ok(pasted.trim().to_string())
+        }
+    })
+}
+
+fn explain_web_app_redirect_if_needed(options: &TeamLoginOptions, auth: &TeamAuthConfig) {
+    let Some(app_url) = options.app_url.as_deref() else {
+        return;
+    };
+
+    eprintln!();
+    eprintln!(
+        "Note: this Cognito client redirects back to {}.",
+        auth.redirect_uri
+    );
+    eprintln!(
+        "If the browser lands in TEAM without code= in the address bar, the web app already consumed the authorization code."
+    );
+    eprintln!(
+        "For automatic CLI login, register a loopback callback such as http://127.0.0.1:53682/callback on the TEAM Cognito app client, then run:"
+    );
+    eprintln!(
+        "  awsp team login --app-url {app_url} --redirect-uri http://127.0.0.1:53682/callback"
+    );
+    eprintln!();
 }
 
 pub fn team_status() -> Result<()> {
@@ -1094,6 +1146,104 @@ fn open_browser(url: &str) {
     }
 }
 
+fn bind_loopback_callback(redirect_uri: &str) -> Result<Option<TcpListener>> {
+    let Some(callback) = parse_loopback_redirect_uri(redirect_uri) else {
+        return Ok(None);
+    };
+
+    let listener = TcpListener::bind(format!("{}:{}", callback.bind_host, callback.port))
+        .with_context(|| format!("failed to listen for Cognito callback on {redirect_uri}"))?;
+    Ok(Some(listener))
+}
+
+fn parse_loopback_redirect_uri(value: &str) -> Option<LoopbackRedirectUri> {
+    let rest = value.strip_prefix("http://")?;
+    let authority_end = rest
+        .find(|char| char == '/' || char == '?')
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let (host, port) = parse_host_port(authority)?;
+    if !matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+        return None;
+    }
+
+    let bind_host = if host == "::1" {
+        "[::1]".to_string()
+    } else {
+        host
+    };
+
+    Some(LoopbackRedirectUri { bind_host, port })
+}
+
+fn parse_host_port(authority: &str) -> Option<(String, u16)> {
+    if authority.starts_with('[') {
+        let closing = authority.find(']')?;
+        let host = &authority[1..closing];
+        let port = authority[closing + 1..].strip_prefix(':')?.parse().ok()?;
+        return Some((host.to_string(), port));
+    }
+
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+fn wait_for_loopback_code(listener: TcpListener, expected_state: &str) -> Result<String> {
+    let (mut stream, _) = listener
+        .accept()
+        .context("failed to receive Cognito callback")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .context("failed to set Cognito callback read timeout")?;
+
+    let mut buffer = [0; 16 * 1024];
+    let bytes = stream
+        .read(&mut buffer)
+        .context("failed to read Cognito callback")?;
+    let request = String::from_utf8_lossy(&buffer[..bytes]);
+    let code = extract_authorization_code_from_http_request(&request, Some(expected_state));
+    write_loopback_response(&mut stream, code.is_ok())?;
+    code
+}
+
+fn extract_authorization_code_from_http_request(
+    request: &str,
+    expected_state: Option<&str>,
+) -> Result<String> {
+    let request_line = request
+        .lines()
+        .next()
+        .context("Cognito callback did not contain an HTTP request line")?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().context("Cognito callback missing method")?;
+    let target = parts.next().context("Cognito callback missing path")?;
+    if method != "GET" {
+        bail!("Cognito callback used unsupported HTTP method {method}");
+    }
+
+    extract_authorization_code(target, expected_state)
+}
+
+fn write_loopback_response(stream: &mut impl Write, ok: bool) -> Result<()> {
+    let (status, body) = if ok {
+        (
+            "200 OK",
+            "<!doctype html><title>awsp TEAM login</title><p>Authorization received. Return to the terminal to finish TEAM login.</p>",
+        )
+    } else {
+        (
+            "400 Bad Request",
+            "<!doctype html><title>awsp TEAM login</title><p>awsp could not read the TEAM authorization code. Return to the terminal for details.</p>",
+        )
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .context("failed to write Cognito callback response")
+}
+
 fn prompt_if_missing(
     value: Option<String>,
     question: &str,
@@ -1310,12 +1460,45 @@ mod tests {
     }
 
     #[test]
+    fn extracts_authorization_code_from_loopback_request() {
+        let code = extract_authorization_code_from_http_request(
+            "GET /callback?code=abc%2B123&state=state-1 HTTP/1.1\r\nHost: 127.0.0.1:53682\r\n\r\n",
+            Some("state-1"),
+        )
+        .unwrap();
+
+        assert_eq!(code, "abc+123");
+    }
+
+    #[test]
     fn rejects_redirect_state_mismatch() {
         assert!(extract_authorization_code(
             "https://team.example/callback?code=abc&state=bad",
             Some("good")
         )
         .is_err());
+    }
+
+    #[test]
+    fn detects_loopback_redirect_uris() {
+        assert_eq!(
+            parse_loopback_redirect_uri("http://127.0.0.1:53682/callback"),
+            Some(LoopbackRedirectUri {
+                bind_host: "127.0.0.1".to_string(),
+                port: 53682
+            })
+        );
+        assert_eq!(
+            parse_loopback_redirect_uri("http://localhost:53682/callback"),
+            Some(LoopbackRedirectUri {
+                bind_host: "localhost".to_string(),
+                port: 53682
+            })
+        );
+        assert_eq!(
+            parse_loopback_redirect_uri("https://team.example.com/"),
+            None
+        );
     }
 
     #[test]

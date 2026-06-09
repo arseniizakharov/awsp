@@ -3,8 +3,8 @@
 class Awsp < Formula
   desc "AWS CLI sessions manager"
   homepage "https://github.com/arseniizakharov/awsp"
-  url "https://github.com/arseniizakharov/awsp/releases/download/v1.0.1/awsp-v1.0.1-aarch64-apple-darwin.tar.gz"
-  sha256 "0a879acb0d157a4f1d01c4460268bb0bd81a462a7f73fced7912ff0e32494162"
+  url "https://github.com/arseniizakharov/awsp/releases/download/v1.0.2/awsp-v1.0.2-aarch64-apple-darwin.tar.gz"
+  sha256 "d6697bcbc3ab396152ffa5490af25128a6fffccb06068b3698c5f4f9aab3c552"
   license any_of: ["MIT", "Apache-2.0"]
 
   depends_on arch: :arm64
