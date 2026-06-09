@@ -52,15 +52,6 @@ query GetEntitlement($userId: String, $groupIds: [String]) {
 }
 "#;
 
-const VALIDATE_REQUEST: &str = r#"
-query ValidateRequest($accountId: String!, $roleId: String!, $userId: String!, $groupIds: [String]!) {
-  validateRequest(accountId: $accountId, roleId: $roleId, userId: $userId, groupIds: $groupIds) {
-    valid
-    reason
-  }
-}
-"#;
-
 const CREATE_REQUEST: &str = r#"
 mutation CreateRequests($input: CreateRequestsInput!) {
   createRequests(input: $input) {
@@ -177,7 +168,6 @@ pub fn request_access(
         }
     }
 
-    client.validate_request(&target, &identity)?;
     client.create_request(&target, &input)
 }
 
@@ -630,34 +620,6 @@ impl TeamClient {
             profile.account_id,
             profile.role_name
         );
-    }
-
-    fn validate_request(&self, target: &RequestTarget, identity: &TeamIdentity) -> Result<()> {
-        let data = self.call_graphql(
-            VALIDATE_REQUEST,
-            json!({
-                "accountId": target.account_id,
-                "roleId": target.role_id,
-                "userId": identity.user_id,
-                "groupIds": identity.group_ids,
-            }),
-        )?;
-        let validation = data
-            .get("validateRequest")
-            .context("TEAM validateRequest response missing")?;
-        if validation
-            .get("valid")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        let reason = validation
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown reason");
-        bail!("TEAM denied this request: {reason}");
     }
 
     fn create_request(
