@@ -156,6 +156,7 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum TeamCommand {
     /// Sign in to TEAM and cache Cognito tokens.
     Login {

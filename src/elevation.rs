@@ -52,15 +52,6 @@ query GetEntitlement($userId: String, $groupIds: [String]) {
 }
 "#;
 
-const VALIDATE_REQUEST: &str = r#"
-query ValidateRequest($accountId: String!, $roleId: String!, $userId: String!, $groupIds: [String]!) {
-  validateRequest(accountId: $accountId, roleId: $roleId, userId: $userId, groupIds: $groupIds) {
-    valid
-    reason
-  }
-}
-"#;
-
 const GET_APPROVERS: &str = r#"
 query GetApprovers($id: ID!) {
   getApprovers(id: $id) {
@@ -228,7 +219,9 @@ pub fn request_access(
     if let Some(existing) = client.find_pending_request(&target)? {
         return Ok(existing);
     }
-    client.validate_request_target(&target, &identity)?;
+    if target.approval_required {
+        client.ensure_approver_available(&target, &identity)?;
+    }
     let input = collect_request_input(profile, &target, options)?;
 
     if !options.yes {
@@ -773,42 +766,6 @@ impl TeamClient {
         Ok(None)
     }
 
-    fn validate_request_target(
-        &self,
-        target: &RequestTarget,
-        identity: &TeamIdentity,
-    ) -> Result<()> {
-        let validation = self.call_graphql(
-            VALIDATE_REQUEST,
-            json!({
-                "accountId": target.account_id,
-                "roleId": target.role_id,
-                "userId": identity.user_id,
-                "groupIds": identity.group_ids,
-            }),
-        )?;
-        let validation = validation
-            .get("validateRequest")
-            .context("TEAM validateRequest response missing")?;
-        let valid = validation
-            .get("valid")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !valid {
-            let reason = validation
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("TEAM rejected the request target");
-            bail!("TEAM rejected this request before submission: {reason}");
-        }
-
-        if target.approval_required {
-            self.ensure_approver_available(target, identity)?;
-        }
-
-        Ok(())
-    }
-
     fn ensure_approver_available(
         &self,
         target: &RequestTarget,
@@ -1263,7 +1220,7 @@ fn extract_js_scope_field(source: &str) -> Option<String> {
     let end = array.find(']')?;
     let mut scopes = Vec::new();
     let mut rest = &array[..end];
-    while let Some(index) = rest.find(|char| char == '"' || char == '\'') {
+    while let Some(index) = rest.find(['"', '\'']) {
         rest = &rest[index..];
         let quote = rest.as_bytes().first().copied()?;
         let mut value = String::new();
@@ -1953,9 +1910,7 @@ fn bind_loopback_callback(redirect_uri: &str) -> Result<Option<TcpListener>> {
 
 fn parse_loopback_redirect_uri(value: &str) -> Option<LoopbackRedirectUri> {
     let rest = value.strip_prefix("http://")?;
-    let authority_end = rest
-        .find(|char| char == '/' || char == '?')
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     let (host, port) = parse_host_port(authority)?;
     if !matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
@@ -2208,6 +2163,35 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn decodes_jwt_identity_claims() {
@@ -2354,6 +2338,114 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[test]
+    fn request_access_does_not_call_validate_request_preflight() -> Result<()> {
+        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_guard = EnvGuard::capture(&[
+            "PATH",
+            "AWSP_TEST_GRAPHQL_LOG",
+            TEAM_ENDPOINT_ENV,
+            TEAM_TOKEN_ENV,
+        ]);
+        let tempdir = tempfile::tempdir()?;
+        let bin_dir = tempdir.path().join("bin");
+        std::fs::create_dir(&bin_dir)?;
+        let curl_path = bin_dir.join("curl");
+        std::fs::write(
+            &curl_path,
+            r#"#!/bin/sh
+payload=$(cat)
+{
+  printf '%s\n' "$payload"
+  printf '%s\n' '---'
+} >> "$AWSP_TEST_GRAPHQL_LOG"
+
+case "$payload" in
+  *GetEntitlement*)
+    printf '%s' '{"data":{"getEntitlement":[{"accounts":[{"name":"prod","id":"111122223333"}],"permissions":[{"name":"Admin","id":"role-1"}],"approvalRequired":true,"duration":"4"}]}}'
+    ;;
+  *ValidateRequest*)
+    printf '%s' '{"errors":[{"message":"Validation error of type UnknownArgument: Unknown field argument accountId @ '\''validateRequest'\''"},{"message":"Validation error of type FieldUndefined: Field '\''valid'\'' in type '\''requests'\'' is undefined @ '\''validateRequest/valid'\''"}]}'
+    ;;
+  *GetApprovers*)
+    printf '%s' '{"data":{"getApprovers":{"id":"111122223333","groupIds":["approver-group"]}}}'
+    ;;
+  *ListGroups*)
+    printf '%s' '{"data":{"listGroups":{"members":["approver@example.com"]}}}'
+    ;;
+  *CreateRequests*)
+    printf '%s' '{"data":{"createRequests":{"id":"req-1","email":"user@example.com","status":"pending"}}}'
+    ;;
+  *GetRequests*)
+    printf '%s' '{"data":{"getRequests":{"id":"req-1","email":"user@example.com","username":"IDC_user@example.com","status":"pending","approvers":["approver@example.com"],"approver_ids":[],"session_duration":"2"}}}'
+    ;;
+  *)
+    printf '%s' '{"errors":[{"message":"unexpected GraphQL operation"}]}'
+    ;;
+esac
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&curl_path)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&curl_path, permissions)?;
+        }
+
+        let log_path = tempdir.path().join("graphql.log");
+        let mut paths = vec![bin_dir];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths)?);
+        std::env::set_var("AWSP_TEST_GRAPHQL_LOG", &log_path);
+        std::env::set_var(TEAM_ENDPOINT_ENV, "https://team.example/graphql");
+        std::env::set_var(
+            TEAM_TOKEN_ENV,
+            format!(
+                "e30.{}.",
+                base64_url_encode(
+                    br#"{"userId":"u-1","groupIds":["requester-group"],"cognito:username":"IDC_user@example.com","exp":4102444800}"#
+                )
+            ),
+        );
+
+        let profile = SsoProfile {
+            name: "common-prod-rw".to_string(),
+            sso_session: Some("corp".to_string()),
+            sso_start_url: "https://example.awsapps.com/start".to_string(),
+            sso_region: "us-east-1".to_string(),
+            account_id: "111122223333".to_string(),
+            role_name: "Admin".to_string(),
+            region: crate::aws_config::RegionDisplay::Unset,
+        };
+        let options = ElevationOptions {
+            duration_hours: Some("2".to_string()),
+            ticket_no: Some("TEAM-123".to_string()),
+            justification: Some("deploy".to_string()),
+            yes: true,
+        };
+
+        let outcome = request_access(&profile, &options)?;
+
+        assert_eq!(
+            outcome,
+            ElevationOutcome::Submitted {
+                id: "req-1".to_string(),
+                status: "pending".to_string()
+            }
+        );
+        let log = std::fs::read_to_string(log_path)?;
+        assert!(log.contains("GetEntitlement"));
+        assert!(log.contains("GetApprovers"));
+        assert!(log.contains("ListGroups"));
+        assert!(log.contains("CreateRequests"));
+        assert!(!log.contains("ValidateRequest"));
+
+        Ok(())
     }
 
     #[test]
