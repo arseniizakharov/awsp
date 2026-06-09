@@ -6,10 +6,16 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::io::{Read, Write};
+use std::fs;
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message, WebSocket};
 use uuid::Uuid;
 
 const TEAM_ENDPOINT_ENV: &str = "AWSP_TEAM_GRAPHQL_ENDPOINT";
@@ -75,6 +81,7 @@ pub struct TeamLoginOptions {
     pub idp_identifier: Option<String>,
     pub code: Option<String>,
     pub redirected_url: Option<String>,
+    pub browser_capture: bool,
     pub no_open: bool,
 }
 
@@ -172,24 +179,30 @@ pub fn team_login(options: TeamLoginOptions) -> Result<()> {
     let challenge = code_challenge(&verifier);
     let state_value = Uuid::new_v4().to_string();
     let authorize_url = auth.authorize_url(&challenge, &state_value);
-    let callback_listener = if options.code.is_none() && options.redirected_url.is_none() {
-        bind_loopback_callback(&auth.redirect_uri)?
-    } else {
-        None
-    };
+    let callback_listener =
+        if options.code.is_none() && options.redirected_url.is_none() && !options.browser_capture {
+            bind_loopback_callback(&auth.redirect_uri)?
+        } else {
+            None
+        };
     let has_callback_listener = callback_listener.is_some();
 
-    eprintln!("Open this TEAM sign-in URL:");
-    eprintln!("{authorize_url}");
-    if has_callback_listener {
-        eprintln!(
-            "Waiting for Cognito to redirect back to {}.",
-            auth.redirect_uri
-        );
+    if options.browser_capture {
+        eprintln!("Opening a temporary browser to capture TEAM sign-in.");
+        eprintln!("Cognito will still redirect to {}.", auth.redirect_uri);
     } else {
-        explain_web_app_redirect_if_needed(&options, &auth);
+        eprintln!("Open this TEAM sign-in URL:");
+        eprintln!("{authorize_url}");
+        if has_callback_listener {
+            eprintln!(
+                "Waiting for Cognito to redirect back to {}.",
+                auth.redirect_uri
+            );
+        } else {
+            explain_web_app_redirect_if_needed(&options, &auth);
+        }
     }
-    if !options.no_open {
+    if !options.no_open && !options.browser_capture {
         open_browser(&authorize_url);
     }
 
@@ -197,7 +210,13 @@ pub fn team_login(options: TeamLoginOptions) -> Result<()> {
         (Some(code), _) => code.trim().to_string(),
         (_, Some(url)) => extract_authorization_code(url, Some(&state_value))?,
         (None, None) => {
-            if let Some(listener) = callback_listener {
+            if options.browser_capture {
+                capture_authorization_code_with_browser(
+                    &authorize_url,
+                    &auth.redirect_uri,
+                    &state_value,
+                )?
+            } else if let Some(listener) = callback_listener {
                 wait_for_loopback_code(listener, &state_value)?
             } else {
                 prompt_for_authorization_code(&state_value)?
@@ -790,8 +809,12 @@ fn normalize_app_url(value: &str) -> String {
 }
 
 fn fetch_text(url: &str, label: &str) -> Result<String> {
+    fetch_text_with_timeout(url, label, 30)
+}
+
+fn fetch_text_with_timeout(url: &str, label: &str, timeout_seconds: u64) -> Result<String> {
     let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "30", url])
+        .args(["-fsSL", "--max-time", &timeout_seconds.to_string(), url])
         .output()
         .with_context(|| format!("failed to run curl for {label}"))?;
     if !output.status.success() {
@@ -1131,6 +1154,327 @@ fn token_exp(token: &str) -> Option<i64> {
     let decoded = decode_base64_url(payload).ok()?;
     let value = serde_json::from_slice::<Value>(&decoded).ok()?;
     value.get("exp").and_then(Value::as_i64)
+}
+
+struct BrowserCaptureSession {
+    child: Child,
+    _profile: TempDir,
+    port: u16,
+}
+
+impl BrowserCaptureSession {
+    fn launch() -> Result<Self> {
+        let browser = find_capture_browser()?;
+        let profile = tempfile::tempdir().context("failed to create temporary browser profile")?;
+        let mut child = Command::new(&browser)
+            .arg("--remote-debugging-port=0")
+            .arg("--remote-debugging-address=127.0.0.1")
+            .arg("--remote-allow-origins=*")
+            .arg(format!("--user-data-dir={}", profile.path().display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-background-networking")
+            .arg("--disable-default-apps")
+            .arg("--new-window")
+            .arg("about:blank")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to launch browser at {}", browser.display()))?;
+
+        let port = wait_for_devtools_port(profile.path(), &mut child)?;
+        Ok(Self {
+            child,
+            _profile: profile,
+            port,
+        })
+    }
+}
+
+impl Drop for BrowserCaptureSession {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+type CdpSocket = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
+
+fn capture_authorization_code_with_browser(
+    authorize_url: &str,
+    redirect_uri: &str,
+    expected_state: &str,
+) -> Result<String> {
+    let session = BrowserCaptureSession::launch()?;
+    let page_ws_url = wait_for_page_websocket_url(session.port)?;
+    let (mut socket, _) = connect(page_ws_url.as_str())
+        .with_context(|| format!("failed to connect to Chrome DevTools at {page_ws_url}"))?;
+    set_cdp_read_timeout(&mut socket, Duration::from_secs(1))?;
+
+    let mut id = 1;
+    cdp_send(&mut socket, &mut id, "Page.enable", json!({}))?;
+    cdp_send(&mut socket, &mut id, "Network.enable", json!({}))?;
+    cdp_send(
+        &mut socket,
+        &mut id,
+        "Fetch.enable",
+        json!({
+            "patterns": [{
+                "urlPattern": callback_capture_pattern(redirect_uri),
+                "requestStage": "Request"
+            }]
+        }),
+    )?;
+    cdp_send(
+        &mut socket,
+        &mut id,
+        "Page.navigate",
+        json!({ "url": authorize_url }),
+    )?;
+
+    eprintln!("Complete TEAM sign-in in the temporary browser window.");
+    wait_for_browser_captured_code(&mut socket, &mut id, expected_state)
+}
+
+fn wait_for_browser_captured_code(
+    socket: &mut CdpSocket,
+    id: &mut u64,
+    expected_state: &str,
+) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    loop {
+        if Instant::now() > deadline {
+            bail!("timed out waiting for TEAM browser redirect");
+        }
+
+        let message = match socket.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::Io(error))
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).context("failed to read Chrome DevTools message"),
+        };
+        let Ok(text) = message.to_text() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let Some(method) = value.get("method").and_then(Value::as_str) else {
+            continue;
+        };
+
+        match method {
+            "Fetch.requestPaused" => {
+                let params = value.get("params").unwrap_or(&Value::Null);
+                let request_id = params
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .context("Chrome paused a request without requestId")?;
+                let request_url = params
+                    .get("request")
+                    .and_then(|request| request.get("url"))
+                    .and_then(Value::as_str)
+                    .context("Chrome paused a request without URL")?;
+
+                if query_part(request_url).is_some() {
+                    let code = extract_authorization_code(request_url, Some(expected_state));
+                    cdp_send(
+                        socket,
+                        id,
+                        "Fetch.failRequest",
+                        json!({
+                            "requestId": request_id,
+                            "errorReason": "Aborted"
+                        }),
+                    )?;
+                    return code;
+                }
+
+                cdp_send(
+                    socket,
+                    id,
+                    "Fetch.continueRequest",
+                    json!({ "requestId": request_id }),
+                )?;
+            }
+            "Network.requestWillBeSent" | "Page.frameNavigated" => {
+                if let Some(url) = cdp_message_url(&value) {
+                    if let Ok(code) = extract_authorization_code(url, Some(expected_state)) {
+                        return Ok(code);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn cdp_message_url(value: &Value) -> Option<&str> {
+    value
+        .pointer("/params/request/url")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/params/frame/url").and_then(Value::as_str))
+}
+
+fn cdp_send(socket: &mut CdpSocket, id: &mut u64, method: &str, params: Value) -> Result<()> {
+    let message_id = *id;
+    *id += 1;
+    let message = json!({
+        "id": message_id,
+        "method": method,
+        "params": params,
+    });
+    socket
+        .send(Message::text(message.to_string()))
+        .with_context(|| format!("failed to send Chrome DevTools command {method}"))
+}
+
+fn set_cdp_read_timeout(socket: &mut CdpSocket, timeout: Duration) -> Result<()> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => stream
+            .set_read_timeout(Some(timeout))
+            .context("failed to set Chrome DevTools read timeout"),
+        #[allow(unreachable_patterns)]
+        _ => Ok(()),
+    }
+}
+
+fn wait_for_devtools_port(profile: &Path, child: &mut Child) -> Result<u16> {
+    let active_port = profile.join("DevToolsActivePort");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(text) = fs::read_to_string(&active_port) {
+            if let Some(port) = parse_devtools_active_port(&text) {
+                return Ok(port);
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect Chrome capture process")?
+        {
+            bail!("Chrome exited before DevTools was ready: {status}");
+        }
+        if Instant::now() > deadline {
+            bail!("timed out waiting for Chrome DevTools to start");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn parse_devtools_active_port(text: &str) -> Option<u16> {
+    text.lines().next()?.trim().parse().ok()
+}
+
+fn wait_for_page_websocket_url(port: u16) -> Result<String> {
+    let endpoint = format!("http://127.0.0.1:{port}/json/list");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = fetch_text_with_timeout(&endpoint, "Chrome target list", 1) {
+            if let Some(url) = page_websocket_url_from_targets(&text)? {
+                return Ok(url);
+            }
+        }
+        if Instant::now() > deadline {
+            bail!("timed out waiting for Chrome page target");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn page_websocket_url_from_targets(text: &str) -> Result<Option<String>> {
+    let targets: Value =
+        serde_json::from_str(text).context("Chrome target list was not valid JSON")?;
+    let Some(targets) = targets.as_array() else {
+        return Ok(None);
+    };
+
+    Ok(targets
+        .iter()
+        .find(|target| {
+            target.get("type").and_then(Value::as_str) == Some("page")
+                && target.get("webSocketDebuggerUrl").is_some()
+        })
+        .and_then(|target| target.get("webSocketDebuggerUrl"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+fn callback_capture_pattern(redirect_uri: &str) -> String {
+    let redirect_uri = redirect_uri.trim();
+    if redirect_uri.contains('?') {
+        format!("{redirect_uri}*")
+    } else {
+        format!("{redirect_uri}?*")
+    }
+}
+
+fn find_capture_browser() -> Result<PathBuf> {
+    capture_browser_candidates()
+        .into_iter()
+        .find(|candidate| command_is_available(candidate))
+        .context(
+            "could not find Chrome/Chromium for --browser-capture; set AWSP_BROWSER to the browser executable path",
+        )
+}
+
+fn capture_browser_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(value) = env::var("AWSP_BROWSER") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            candidates.push(PathBuf::from(trimmed));
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        candidates.extend([
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            PathBuf::from(
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            ),
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+            PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ]);
+        if let Ok(home) = env::var("HOME") {
+            candidates.extend([
+                PathBuf::from(format!(
+                    "{home}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                )),
+                PathBuf::from(format!(
+                    "{home}/Applications/Chromium.app/Contents/MacOS/Chromium"
+                )),
+            ]);
+        }
+    }
+
+    candidates.extend([
+        PathBuf::from("google-chrome"),
+        PathBuf::from("google-chrome-stable"),
+        PathBuf::from("chromium"),
+        PathBuf::from("chromium-browser"),
+        PathBuf::from("microsoft-edge"),
+    ]);
+    candidates
+}
+
+fn command_is_available(candidate: &Path) -> bool {
+    if candidate.components().count() > 1 {
+        return candidate.exists();
+    }
+
+    Command::new(candidate)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn open_browser(url: &str) {
@@ -1498,6 +1842,42 @@ mod tests {
         assert_eq!(
             parse_loopback_redirect_uri("https://team.example.com/"),
             None
+        );
+    }
+
+    #[test]
+    fn builds_callback_capture_patterns() {
+        assert_eq!(
+            callback_capture_pattern("https://team.example.com/"),
+            "https://team.example.com/?*"
+        );
+        assert_eq!(
+            callback_capture_pattern("https://team.example.com/callback"),
+            "https://team.example.com/callback?*"
+        );
+    }
+
+    #[test]
+    fn parses_devtools_active_port() {
+        assert_eq!(
+            parse_devtools_active_port("53682\n/devtools/browser/id\n"),
+            Some(53682)
+        );
+        assert_eq!(parse_devtools_active_port("not-a-port\n"), None);
+    }
+
+    #[test]
+    fn extracts_page_websocket_url_from_targets() {
+        let targets = r#"
+            [
+              {"type":"service_worker","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/worker"},
+              {"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/page"}
+            ]
+        "#;
+
+        assert_eq!(
+            page_websocket_url_from_targets(targets).unwrap(),
+            Some("ws://127.0.0.1:1/devtools/page/page".to_string())
         );
     }
 

@@ -186,6 +186,9 @@ enum TeamCommand {
         /// Full redirected URL containing code=...
         #[arg(long)]
         redirected_url: Option<String>,
+        /// Capture the Cognito redirect with a temporary Chrome/Chromium window.
+        #[arg(long, conflicts_with = "no_open")]
+        browser_capture: bool,
         /// Print the sign-in URL without trying to open a browser.
         #[arg(long)]
         no_open: bool,
@@ -285,6 +288,7 @@ fn run() -> Result<()> {
                 idp_identifier,
                 code,
                 redirected_url,
+                browser_capture,
                 no_open,
             } => elevation::team_login(TeamLoginOptions {
                 app_url,
@@ -296,6 +300,7 @@ fn run() -> Result<()> {
                 idp_identifier,
                 code,
                 redirected_url,
+                browser_capture,
                 no_open,
             }),
             TeamCommand::Status => elevation::team_status(),
