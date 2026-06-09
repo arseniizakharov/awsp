@@ -52,6 +52,40 @@ query GetEntitlement($userId: String, $groupIds: [String]) {
 }
 "#;
 
+const VALIDATE_REQUEST: &str = r#"
+query ValidateRequest($accountId: String!, $roleId: String!, $userId: String!, $groupIds: [String]!) {
+  validateRequest(accountId: $accountId, roleId: $roleId, userId: $userId, groupIds: $groupIds) {
+    valid
+    reason
+  }
+}
+"#;
+
+const GET_APPROVERS: &str = r#"
+query GetApprovers($id: ID!) {
+  getApprovers(id: $id) {
+    id
+    groupIds
+  }
+}
+"#;
+
+const GET_OU: &str = r#"
+query GetOU($id: String) {
+  getOU(id: $id) {
+    Id
+  }
+}
+"#;
+
+const LIST_GROUPS: &str = r#"
+query ListGroups($groupIds: [String]) {
+  listGroups(groupIds: $groupIds) {
+    members
+  }
+}
+"#;
+
 const CREATE_REQUEST: &str = r#"
 mutation CreateRequests($input: CreateRequestsInput!) {
   createRequests(input: $input) {
@@ -176,6 +210,7 @@ struct RequestTarget {
     role_name: String,
     role_id: String,
     max_duration: Option<String>,
+    approval_required: bool,
 }
 
 pub fn request_access(
@@ -193,6 +228,7 @@ pub fn request_access(
     if let Some(existing) = client.find_pending_request(&target)? {
         return Ok(existing);
     }
+    client.validate_request_target(&target, &identity)?;
     let input = collect_request_input(profile, &target, options)?;
 
     if !options.yes {
@@ -688,6 +724,10 @@ impl TeamClient {
                     .get("duration")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                approval_required: entitlement
+                    .get("approvalRequired")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             });
         }
 
@@ -731,6 +771,147 @@ impl TeamClient {
         }
 
         Ok(None)
+    }
+
+    fn validate_request_target(
+        &self,
+        target: &RequestTarget,
+        identity: &TeamIdentity,
+    ) -> Result<()> {
+        let validation = self.call_graphql(
+            VALIDATE_REQUEST,
+            json!({
+                "accountId": target.account_id,
+                "roleId": target.role_id,
+                "userId": identity.user_id,
+                "groupIds": identity.group_ids,
+            }),
+        )?;
+        let validation = validation
+            .get("validateRequest")
+            .context("TEAM validateRequest response missing")?;
+        let valid = validation
+            .get("valid")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !valid {
+            let reason = validation
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("TEAM rejected the request target");
+            bail!("TEAM rejected this request before submission: {reason}");
+        }
+
+        if target.approval_required {
+            self.ensure_approver_available(target, identity)?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_approver_available(
+        &self,
+        target: &RequestTarget,
+        identity: &TeamIdentity,
+    ) -> Result<()> {
+        let mut checked = Vec::new();
+        if self.approver_scope_has_required_members(
+            "account",
+            &target.account_id,
+            &identity.group_ids,
+            &mut checked,
+        )? {
+            return Ok(());
+        }
+
+        if let Some(ou_id) = self.parent_ou_id(&target.account_id)? {
+            if self.approver_scope_has_required_members(
+                "OU",
+                &ou_id,
+                &identity.group_ids,
+                &mut checked,
+            )? {
+                return Ok(());
+            }
+        }
+
+        let checked = if checked.is_empty() {
+            "no approver groups configured on the account or parent OU".to_string()
+        } else {
+            checked.join("; ")
+        };
+        bail!(
+            "TEAM has no usable approver group for {} / {}: {checked}. The TEAM UI would reject this request before submission.",
+            target.account_name,
+            target.role_name
+        );
+    }
+
+    fn approver_scope_has_required_members(
+        &self,
+        scope_name: &str,
+        scope_id: &str,
+        requester_group_ids: &[String],
+        checked: &mut Vec<String>,
+    ) -> Result<bool> {
+        let Some(approver_group_ids) = self.approver_group_ids(scope_id)? else {
+            checked.push(format!("{scope_name} {scope_id}: no approver group"));
+            return Ok(false);
+        };
+        let member_count = self.approver_member_count(&approver_group_ids)?;
+        let required = required_approver_members(requester_group_ids, &approver_group_ids);
+        checked.push(format!(
+            "{scope_name} {scope_id}: {member_count}/{required} approver members"
+        ));
+
+        Ok(member_count >= required)
+    }
+
+    fn approver_group_ids(&self, id: &str) -> Result<Option<Vec<String>>> {
+        let data = self.call_graphql(
+            GET_APPROVERS,
+            json!({
+                "id": id,
+            }),
+        )?;
+        let Some(approvers) = data.get("getApprovers").filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let group_ids = group_ids_from_claim(approvers.get("groupIds")).unwrap_or_default();
+        if group_ids.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(group_ids))
+        }
+    }
+
+    fn parent_ou_id(&self, account_id: &str) -> Result<Option<String>> {
+        let data = self.call_graphql(
+            GET_OU,
+            json!({
+                "id": account_id,
+            }),
+        )?;
+        Ok(data
+            .get("getOU")
+            .and_then(|value| value.get("Id"))
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    fn approver_member_count(&self, approver_group_ids: &[String]) -> Result<usize> {
+        let data = self.call_graphql(
+            LIST_GROUPS,
+            json!({
+                "groupIds": approver_group_ids,
+            }),
+        )?;
+        let members = data
+            .get("listGroups")
+            .and_then(|value| value.get("members"))
+            .and_then(Value::as_array)
+            .context("TEAM listGroups response missing members")?;
+        Ok(members.len())
     }
 
     fn create_request(
@@ -1430,6 +1611,21 @@ fn request_is_enriched_for_team_ui(request: Option<&Value>) -> bool {
             .unwrap_or(false);
 
     has_email && has_approver
+}
+
+fn required_approver_members(
+    requester_group_ids: &[String],
+    approver_group_ids: &[String],
+) -> usize {
+    if requester_group_ids.iter().any(|requester_group| {
+        approver_group_ids
+            .iter()
+            .any(|approver_group| approver_group == requester_group)
+    }) {
+        2
+    } else {
+        1
+    }
 }
 
 fn created_request_debug_summary(request: &Value) -> String {
@@ -2146,6 +2342,21 @@ mod tests {
     }
 
     #[test]
+    fn requires_second_approver_when_requester_is_in_approver_group() {
+        assert_eq!(
+            required_approver_members(&["requester-group".to_string()], &["other".to_string()]),
+            1
+        );
+        assert_eq!(
+            required_approver_members(
+                &["requester-group".to_string()],
+                &["requester-group".to_string()]
+            ),
+            2
+        );
+    }
+
+    #[test]
     fn builds_create_request_input_like_team_browser_form() {
         let target = RequestTarget {
             account_id: "111122223333".to_string(),
@@ -2153,6 +2364,7 @@ mod tests {
             role_name: "Admin".to_string(),
             role_id: "arn:aws:sso:::permissionSet/ssoins-1/ps-1".to_string(),
             max_duration: Some("3".to_string()),
+            approval_required: true,
         };
         let input = RequestInput {
             duration_hours: "2".to_string(),
