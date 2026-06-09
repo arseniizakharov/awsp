@@ -1,3 +1,4 @@
+use crate::aws_config::SsoProfile;
 use anyhow::{bail, Context, Result};
 use std::fs::OpenOptions;
 use std::process::{Command, Stdio};
@@ -39,6 +40,14 @@ pub enum AwsOutput {
     UserTerminal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsoRoleAccess {
+    Available,
+    LoginExpired { message: String },
+    AssignmentMissing { message: String },
+    UnknownFailure { message: String },
+}
+
 pub fn login_profile(profile: &str, output: AwsOutput) -> Result<()> {
     ensure_available()?;
 
@@ -56,6 +65,68 @@ pub fn login_profile(profile: &str, output: AwsOutput) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn sso_role_access(profile: &SsoProfile, access_token: &str) -> Result<SsoRoleAccess> {
+    ensure_available()?;
+
+    let output = Command::new("aws")
+        .args([
+            "sso",
+            "get-role-credentials",
+            "--account-id",
+            &profile.account_id,
+            "--role-name",
+            &profile.role_name,
+            "--access-token",
+            access_token,
+            "--region",
+            &profile.sso_region,
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ])
+        .env("AWS_PAGER", "")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| "failed to run aws sso get-role-credentials")?;
+
+    if output.status.success() {
+        return Ok(SsoRoleAccess::Available);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Ok(classify_sso_role_access_error(&stderr))
+}
+
+fn classify_sso_role_access_error(stderr: &str) -> SsoRoleAccess {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("unauthorizedexception")
+        || lower.contains("session token not found")
+        || lower.contains("invalid token")
+        || lower.contains("token has expired")
+        || lower.contains("invalidgrant")
+    {
+        return SsoRoleAccess::LoginExpired {
+            message: stderr.to_string(),
+        };
+    }
+
+    if lower.contains("forbiddenexception")
+        || lower.contains("resourcenotfoundexception")
+        || lower.contains("no access")
+        || lower.contains("not assigned")
+        || lower.contains("role cannot be found")
+        || lower.contains("account and role")
+    {
+        return SsoRoleAccess::AssignmentMissing {
+            message: stderr.to_string(),
+        };
+    }
+
+    SsoRoleAccess::UnknownFailure {
+        message: stderr.to_string(),
+    }
 }
 
 fn user_stdout(output: AwsOutput) -> Stdio {
@@ -174,5 +245,25 @@ mod tests {
         assert!(message.contains("AWS CLI is required"));
         assert!(message.contains("brew install awscli"));
         assert!(message.contains("awsp doctor"));
+    }
+
+    #[test]
+    fn classifies_sso_access_errors() {
+        assert!(matches!(
+            classify_sso_role_access_error(
+                "An error occurred (UnauthorizedException) when calling the GetRoleCredentials operation: Session token not found or invalid"
+            ),
+            SsoRoleAccess::LoginExpired { .. }
+        ));
+        assert!(matches!(
+            classify_sso_role_access_error(
+                "An error occurred (ForbiddenException) when calling the GetRoleCredentials operation: No access"
+            ),
+            SsoRoleAccess::AssignmentMissing { .. }
+        ));
+        assert!(matches!(
+            classify_sso_role_access_error("network melted"),
+            SsoRoleAccess::UnknownFailure { .. }
+        ));
     }
 }

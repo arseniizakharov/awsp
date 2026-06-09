@@ -19,6 +19,12 @@ pub struct CacheStatus {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsoAccessToken {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 impl fmt::Display for LoginStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -31,6 +37,10 @@ impl fmt::Display for LoginStatus {
 
 pub fn cache_status_for_profile(profile: &SsoProfile) -> CacheStatus {
     cache_status_for_profile_in_dir(profile, &cache_dir())
+}
+
+pub fn access_token_for_profile(profile: &SsoProfile) -> Option<SsoAccessToken> {
+    access_token_for_profile_in_dir(profile, &cache_dir())
 }
 
 fn cache_status_for_profile_in_dir(profile: &SsoProfile, dir: &Path) -> CacheStatus {
@@ -84,6 +94,63 @@ fn cache_status_for_profile_in_dir(profile: &SsoProfile, dir: &Path) -> CacheSta
     } else {
         CacheStatus::unknown()
     }
+}
+
+fn access_token_for_profile_in_dir(profile: &SsoProfile, dir: &Path) -> Option<SsoAccessToken> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut best = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+
+        if !matches_profile_cache(&value, profile) {
+            continue;
+        }
+
+        let Some(expires_at) = value.get("expiresAt").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(expires_at) = parse_aws_expiry(expires_at) else {
+            continue;
+        };
+        if expires_at <= Utc::now() {
+            continue;
+        }
+
+        let Some(token) = value
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        else {
+            continue;
+        };
+
+        let candidate = SsoAccessToken {
+            token: token.to_string(),
+            expires_at,
+        };
+        if best
+            .as_ref()
+            .map(|current: &SsoAccessToken| candidate.expires_at > current.expires_at)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    best
 }
 
 impl CacheStatus {
@@ -239,5 +306,34 @@ mod tests {
     #[test]
     fn labels_unknown_cache_status() {
         assert_eq!(CacheStatus::unknown().label(), "unknown");
+    }
+
+    #[test]
+    fn reads_latest_valid_access_token() {
+        let tempdir = tempfile::tempdir().unwrap();
+        fs::write(
+            tempdir.path().join("older.json"),
+            r#"{
+                "startUrl": "https://example.awsapps.com/start",
+                "region": "us-east-1",
+                "expiresAt": "2999-01-01T00:00:00Z",
+                "accessToken": "older"
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            tempdir.path().join("newer.json"),
+            r#"{
+                "startUrl": "https://example.awsapps.com/start",
+                "region": "us-east-1",
+                "expiresAt": "2999-02-01T00:00:00Z",
+                "accessToken": "newer"
+            }"#,
+        )
+        .unwrap();
+
+        let token = access_token_for_profile_in_dir(&profile(), tempdir.path()).unwrap();
+
+        assert_eq!(token.token, "newer");
     }
 }

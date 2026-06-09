@@ -2,6 +2,7 @@ mod activation;
 mod aws;
 mod aws_config;
 mod cache;
+mod elevation;
 mod onboarding;
 mod output;
 mod palette;
@@ -15,6 +16,7 @@ mod state;
 use anyhow::{bail, Context, Result};
 use aws_config::SsoInventory;
 use clap::{Parser, Subcommand};
+use elevation::{ElevationOptions, TeamLoginOptions};
 use output::OutputMode;
 use picker::PickerView;
 use shell::ShellKind;
@@ -60,6 +62,43 @@ enum Command {
     Use {
         /// Exact AWS profile name. Omit to choose interactively.
         profile: Option<String>,
+        /// Submit a TEAM request automatically when the profile is not assigned.
+        #[arg(long)]
+        elevate: bool,
+        /// TEAM elevated-access duration in hours.
+        #[arg(long)]
+        duration: Option<String>,
+        /// TEAM/change-management ticket number.
+        #[arg(long)]
+        ticket: Option<String>,
+        /// Business justification for the TEAM request.
+        #[arg(long = "why")]
+        justification: Option<String>,
+        /// Do not prompt before submitting the TEAM request.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Request TEAM temporary elevated access for an AWS SSO profile.
+    Request {
+        /// Exact AWS profile name.
+        profile: String,
+        /// TEAM elevated-access duration in hours.
+        #[arg(long)]
+        duration: Option<String>,
+        /// TEAM/change-management ticket number.
+        #[arg(long)]
+        ticket: Option<String>,
+        /// Business justification for the TEAM request.
+        #[arg(long = "why")]
+        justification: Option<String>,
+        /// Do not prompt before submitting the TEAM request.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Manage TEAM temporary elevated-access login.
+    Team {
+        #[command(subcommand)]
+        command: TeamCommand,
     },
     /// Log in to an AWS SSO profile.
     Login {
@@ -117,6 +156,44 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum TeamCommand {
+    /// Sign in to TEAM and cache Cognito tokens.
+    Login {
+        /// TEAM AppSync GraphQL endpoint.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Cognito Hosted UI domain, for example https://example.auth.us-east-1.amazoncognito.com.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Cognito app client id used by the TEAM web UI.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// Redirect URI registered on the Cognito app client.
+        #[arg(long)]
+        redirect_uri: Option<String>,
+        /// OAuth scopes to request.
+        #[arg(long)]
+        scopes: Option<String>,
+        /// Cognito IdP identifier. Defaults to team.
+        #[arg(long)]
+        idp_identifier: Option<String>,
+        /// Authorization code from the Cognito redirect.
+        #[arg(long)]
+        code: Option<String>,
+        /// Full redirected URL containing code=...
+        #[arg(long)]
+        redirected_url: Option<String>,
+        /// Print the sign-in URL without trying to open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Show cached TEAM login status.
+    Status,
+    /// Clear cached TEAM login.
+    Logout,
+}
+
+#[derive(Debug, Subcommand)]
 enum ShellCommand {
     Table,
     Query {
@@ -169,10 +246,56 @@ fn run() -> Result<()> {
             OutputMode::Human
         }),
         Some(Command::List) => list_profiles(),
-        Some(Command::Use { profile }) => {
+        Some(Command::Use {
+            profile,
+            elevate,
+            duration,
+            ticket,
+            justification,
+            yes,
+        }) => {
             require_shell_function_for_activation("awsp use")?;
-            activation::activate_profile(profile, OutputMode::Human)
+            activation::activate_profile_with_options(
+                profile,
+                OutputMode::Human,
+                elevation_options(duration, ticket, justification, yes || elevate),
+            )
         }
+        Some(Command::Request {
+            profile,
+            duration,
+            ticket,
+            justification,
+            yes,
+        }) => activation::request_elevation(
+            &profile,
+            elevation_options(duration, ticket, justification, yes),
+        ),
+        Some(Command::Team { command }) => match command {
+            TeamCommand::Login {
+                endpoint,
+                domain,
+                client_id,
+                redirect_uri,
+                scopes,
+                idp_identifier,
+                code,
+                redirected_url,
+                no_open,
+            } => elevation::team_login(TeamLoginOptions {
+                graphql_endpoint: endpoint,
+                cognito_domain: domain,
+                client_id,
+                redirect_uri,
+                scopes,
+                idp_identifier,
+                code,
+                redirected_url,
+                no_open,
+            }),
+            TeamCommand::Status => elevation::team_status(),
+            TeamCommand::Logout => elevation::team_logout(),
+        },
         Some(Command::Login { profile }) => activation::login_profile(profile),
         Some(Command::LoginSession { session }) => login_session(&session),
         Some(Command::Off) => {
@@ -246,6 +369,8 @@ fn is_direct_fragment(value: &str) -> bool {
                 | "profiles"
                 | "use"
                 | "activate"
+                | "request"
+                | "team"
                 | "login"
                 | "login-session"
                 | "off"
@@ -258,6 +383,20 @@ fn is_direct_fragment(value: &str) -> bool {
                 | "doctor"
                 | "__shell"
         )
+}
+
+fn elevation_options(
+    duration_hours: Option<String>,
+    ticket_no: Option<String>,
+    justification: Option<String>,
+    yes: bool,
+) -> ElevationOptions {
+    ElevationOptions {
+        duration_hours,
+        ticket_no,
+        justification,
+        yes,
+    }
 }
 
 fn setup_shell(shell: Option<ShellKind>) -> Result<()> {

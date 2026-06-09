@@ -1,6 +1,7 @@
 use crate::aws;
 use crate::aws_config::{SsoInventory, SsoProfile};
 use crate::cache::{self, CacheStatus, LoginStatus};
+use crate::elevation::{self, ElevationOptions, ElevationOutcome};
 use crate::output::{self, OutputMode};
 use crate::picker::{self, PickerSelection, PickerView};
 use crate::prompt;
@@ -12,13 +13,29 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::env;
 
 pub fn activate_profile(profile_name: Option<String>, mode: OutputMode) -> Result<()> {
+    activate_profile_with_options(profile_name, mode, ElevationOptions::default())
+}
+
+pub fn activate_profile_with_options(
+    profile_name: Option<String>,
+    mode: OutputMode,
+    elevation_options: ElevationOptions,
+) -> Result<()> {
     match profile_name {
-        Some(profile_name) => activate_exact(&profile_name, mode),
-        None => activate_with_picker(mode, PickerView::Numbered),
+        Some(profile_name) => activate_exact_with_options(&profile_name, mode, elevation_options),
+        None => activate_with_picker_with_options(mode, PickerView::Numbered, elevation_options),
     }
 }
 
 pub fn activate_with_picker(mode: OutputMode, view: PickerView) -> Result<()> {
+    activate_with_picker_with_options(mode, view, ElevationOptions::default())
+}
+
+fn activate_with_picker_with_options(
+    mode: OutputMode,
+    view: PickerView,
+    elevation_options: ElevationOptions,
+) -> Result<()> {
     let inventory = SsoInventory::load_from_env()?;
     let current = active_profile_name_for_inventory(&inventory);
     let selection = select_profile(&inventory, current.as_deref(), view)?;
@@ -26,18 +43,51 @@ pub fn activate_with_picker(mode: OutputMode, view: PickerView) -> Result<()> {
     let selected_name = match selection {
         PickerSelection::Profile(profile) | PickerSelection::Relogin(profile) => profile,
     };
-    switch_to_profile(&inventory, &selected_name, mode, force_login)
+    switch_to_profile(
+        &inventory,
+        &selected_name,
+        mode,
+        force_login,
+        &elevation_options,
+    )
 }
 
 pub fn activate_query(fragment: &str, mode: OutputMode) -> Result<()> {
     let inventory = SsoInventory::load_from_env()?;
     let selected_name = resolve_query_interactively(&inventory, fragment)?;
-    switch_to_profile(&inventory, &selected_name, mode, false)
+    switch_to_profile(
+        &inventory,
+        &selected_name,
+        mode,
+        false,
+        &ElevationOptions::default(),
+    )
 }
 
-pub fn activate_exact(profile_name: &str, mode: OutputMode) -> Result<()> {
+fn activate_exact_with_options(
+    profile_name: &str,
+    mode: OutputMode,
+    elevation_options: ElevationOptions,
+) -> Result<()> {
     let inventory = SsoInventory::load_from_env()?;
-    switch_to_profile(&inventory, profile_name, mode, false)
+    switch_to_profile(&inventory, profile_name, mode, false, &elevation_options)
+}
+
+pub fn request_elevation(profile_name: &str, options: ElevationOptions) -> Result<()> {
+    let inventory = SsoInventory::load_from_env()?;
+    let profile = inventory.require_profile(profile_name)?.clone();
+    match elevation::request_access(&profile, &options)? {
+        ElevationOutcome::Submitted { id, status } => {
+            eprintln!("TEAM request submitted: {id} ({status})");
+            Ok(())
+        }
+        ElevationOutcome::NotConfigured => {
+            bail!("TEAM request submission is not configured")
+        }
+        ElevationOutcome::Declined => {
+            bail!("TEAM request declined")
+        }
+    }
 }
 
 pub fn login_profile(profile_name: Option<String>) -> Result<()> {
@@ -63,6 +113,9 @@ pub fn exec_profile(profile_name: &str, command: Vec<String>) -> Result<()> {
 
     if !ensure_login_for_exec(&profile)? {
         bail!("login declined; command was not run");
+    }
+    if !ensure_assignment_or_request(&profile, OutputMode::Human, &ElevationOptions::default())? {
+        bail!("profile access is not active; command was not run");
     }
 
     let status = std::process::Command::new(&command[0])
@@ -152,10 +205,14 @@ fn switch_to_profile(
     profile_name: &str,
     mode: OutputMode,
     force_login: bool,
+    elevation_options: &ElevationOptions,
 ) -> Result<()> {
     let old_profile = active_profile_name_for_inventory(inventory);
     let profile = inventory.require_profile(profile_name)?.clone();
     ensure_login_for_activation(&profile, mode, force_login)?;
+    if !ensure_assignment_or_request(&profile, mode, elevation_options)? {
+        return Ok(());
+    }
 
     let session_id = ensure_session_id();
     state::set_session_profile(&session_id, &profile.name)?;
@@ -198,6 +255,87 @@ fn ensure_login_for_activation(
         OutputMode::Shell => aws::AwsOutput::UserTerminal,
     };
     aws::login_profile(&profile.name, aws_output)
+}
+
+fn ensure_assignment_or_request(
+    profile: &SsoProfile,
+    mode: OutputMode,
+    elevation_options: &ElevationOptions,
+) -> Result<bool> {
+    let Some(token) = cache::access_token_for_profile(profile) else {
+        return Ok(true);
+    };
+
+    match aws::sso_role_access(profile, &token.token)? {
+        aws::SsoRoleAccess::Available => Ok(true),
+        aws::SsoRoleAccess::LoginExpired { .. } => {
+            output::device_flow_start(profile, &cache::cache_status_for_profile(profile));
+            let aws_output = match mode {
+                OutputMode::Human => aws::AwsOutput::Inherit,
+                OutputMode::Shell => aws::AwsOutput::UserTerminal,
+            };
+            aws::login_profile(&profile.name, aws_output)?;
+            let Some(token) = cache::access_token_for_profile(profile) else {
+                return Ok(true);
+            };
+            match aws::sso_role_access(profile, &token.token)? {
+                aws::SsoRoleAccess::Available => Ok(true),
+                aws::SsoRoleAccess::AssignmentMissing { message } => {
+                    request_missing_assignment(profile, elevation_options, Some(&message))
+                }
+                aws::SsoRoleAccess::LoginExpired { message }
+                | aws::SsoRoleAccess::UnknownFailure { message } => {
+                    bail!(
+                        "could not verify SSO role access for {}: {message}",
+                        profile.name
+                    )
+                }
+            }
+        }
+        aws::SsoRoleAccess::AssignmentMissing { message } => {
+            request_missing_assignment(profile, elevation_options, Some(&message))
+        }
+        aws::SsoRoleAccess::UnknownFailure { message } => {
+            bail!(
+                "could not verify SSO role access for {}: {message}",
+                profile.name
+            )
+        }
+    }
+}
+
+fn request_missing_assignment(
+    profile: &SsoProfile,
+    elevation_options: &ElevationOptions,
+    reason: Option<&str>,
+) -> Result<bool> {
+    eprintln!(
+        "  {} is not currently assigned in IAM Identity Center.",
+        profile.name
+    );
+    if let Some(reason) = reason.filter(|reason| !reason.trim().is_empty()) {
+        eprintln!("  AWS SSO said: {}", reason.trim());
+    }
+
+    match elevation::request_access(profile, elevation_options)? {
+        ElevationOutcome::Submitted { id, status } => {
+            eprintln!("  TEAM request submitted: {id} ({status}).");
+            eprintln!(
+                "  Activate {} again after access becomes active.",
+                profile.name
+            );
+            Ok(false)
+        }
+        ElevationOutcome::NotConfigured => {
+            bail!("TEAM request submission is not configured")
+        }
+        ElevationOutcome::Declined => {
+            bail!(
+                "TEAM request declined; profile {} was not activated",
+                profile.name
+            )
+        }
+    }
 }
 
 fn ensure_login_for_exec(profile: &SsoProfile) -> Result<bool> {

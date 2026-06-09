@@ -143,11 +143,12 @@ impl<'a> PickerState<'a> {
         if self.view == PickerView::Table {
             self.render_table_header(stderr, &columns)?;
             lines += 2;
-        } else {
-            self.render_status_or_filter(stderr)?;
+        } else if self.render_filter_or_empty_state(stderr)? {
             lines += 1;
             queue!(stderr, Print("\r\n"))?;
             lines += 1;
+        } else {
+            queue!(stderr, MoveToColumn(0))?;
         }
 
         if self.model.filtered_len() == 0 {
@@ -204,7 +205,7 @@ impl<'a> PickerState<'a> {
         Ok(())
     }
 
-    fn render_status_or_filter(&self, stderr: &mut Stderr) -> io::Result<()> {
+    fn render_filter_or_empty_state(&self, stderr: &mut Stderr) -> io::Result<bool> {
         queue!(stderr, MoveToColumn(0))?;
         if self.model.filter_is_visible() {
             queue!(
@@ -219,56 +220,42 @@ impl<'a> PickerState<'a> {
                 ResetColor,
                 Print("\r\n")
             )?;
-            return Ok(());
+            return Ok(true);
         }
 
-        let Some(current) = self.model.current_entry() else {
-            queue!(
-                stderr,
-                SetForegroundColor(palette::DIM),
-                Print("○"),
-                SetForegroundColor(palette::MUTED),
-                Print(" no active profile"),
-                SetForegroundColor(palette::DIM),
-                Print("  ·  hint: pick one below"),
-                ResetColor,
-                Print("\r\n")
-            )?;
-            return Ok(());
-        };
+        if self.model.current_entry().is_some() {
+            return Ok(false);
+        }
 
         queue!(
             stderr,
-            SetForegroundColor(palette::MINT),
-            Print("●"),
             SetForegroundColor(palette::DIM),
-            Print(" active "),
-            SetForegroundColor(palette::FG),
-            SetAttribute(Attribute::Bold),
-            Print(&current.profile.name),
-            SetAttribute(Attribute::Reset)
-        )?;
-        separator(stderr)?;
-        queue!(
-            stderr,
+            Print("○"),
             SetForegroundColor(palette::MUTED),
-            Print(&current.profile.account_id)
+            Print(" no active profile"),
+            SetForegroundColor(palette::DIM),
+            Print("  ·  hint: pick one below"),
+            ResetColor,
+            Print("\r\n")
         )?;
-        separator(stderr)?;
-        queue!(
-            stderr,
-            SetForegroundColor(palette::CYAN),
-            Print(current.profile.region.label())
-        )?;
-        separator(stderr)?;
-        queue!(
-            stderr,
-            SetForegroundColor(palette::PURPLE),
-            Print(&current.profile.role_name)
-        )?;
-        separator(stderr)?;
-        render_session_status(stderr, &current.status)?;
-        queue!(stderr, ResetColor, Print("\r\n"))
+        Ok(true)
+    }
+
+    fn render_current_row_status(
+        &self,
+        stderr: &mut Stderr,
+        entry: &PickerEntry<'_>,
+    ) -> io::Result<()> {
+        if entry.is_current {
+            queue!(
+                stderr,
+                SetForegroundColor(palette::GREEN),
+                Print("  ◀ current")
+            )?;
+            separator(stderr)?;
+            render_session_status(stderr, &entry.status)?;
+        }
+        Ok(())
     }
 
     fn render_numbered_row(
@@ -318,14 +305,7 @@ impl<'a> PickerState<'a> {
             SetAttribute(Attribute::Reset)
         )?;
         self.render_profile_cells(stderr, entry, selected, columns)?;
-        if entry.is_current {
-            queue!(
-                stderr,
-                SetForegroundColor(palette::GREEN),
-                Print("  ◀ current"),
-                ResetColor
-            )?;
-        }
+        self.render_current_row_status(stderr, entry)?;
         queue!(stderr, ResetColor, Print("\r\n"))
     }
 

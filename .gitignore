@@ -1,2 +1,9 @@
+.DS_Store
+
+# Rust
 /target/
-/.DS_Store
+
+# Local agent/tool scratch
+.code-review-graph/
+handoff/
+skills-lock.json

@@ -1,10 +1,10 @@
-# Copy this file to github.com/nomadsre/homebrew-awsp as Formula/awsp-beta.rb.
+# Copy this file to github.com/arseniizakharov/homebrew-awsp as Formula/awsp.rb.
 
-class AwspBeta < Formula
-  desc "Switch AWS SSO profiles across shell sessions"
-  homepage "https://github.com/nomadsre/awsp"
-  url "https://github.com/nomadsre/awsp/releases/download/v0.1.0-beta.9/awsp-v0.1.0-beta.9-aarch64-apple-darwin.tar.gz"
-  sha256 "df5df710b57296f070ab261f0a9a12ef18806d91c823d7cf5ca0c40dbf979c1f"
+class Awsp < Formula
+  desc "AWS CLI sessions manager"
+  homepage "https://github.com/arseniizakharov/awsp"
+  url "https://github.com/arseniizakharov/awsp/releases/download/v1.0.0/awsp-v1.0.0-aarch64-apple-darwin.tar.gz"
+  sha256 "f3d2090ccee044bf734164a067c221053f2aff41db534e6edfd590bcca5cc0d6"
   license any_of: ["MIT", "Apache-2.0"]
 
   depends_on arch: :arm64

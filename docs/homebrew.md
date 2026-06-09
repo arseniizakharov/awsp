@@ -1,18 +1,19 @@
-# Homebrew Beta Publishing
+# Homebrew Publishing
 
-`awsp` should be distributed through a dedicated Homebrew tap repo:
+`awsp` is distributed through a dedicated Homebrew tap repo:
 
-- app repo: `github.com/nomadsre/awsp`
-- tap repo: `github.com/nomadsre/homebrew-awsp`
+- app repo: `github.com/arseniizakharov/awsp`
+- tap repo: `github.com/arseniizakharov/homebrew-awsp`
 
-Homebrew maps the tap name `nomadsre/awsp` to the repository `nomadsre/homebrew-awsp`.
+Homebrew maps the tap name `arseniizakharov/awsp` to the repository
+`arseniizakharov/homebrew-awsp`.
 
-## First Beta
+## Release
 
-Tag a beta in the app repo:
+Tag the app repo:
 
 ```sh
-git tag -a v0.1.0-beta.1 -m "v0.1.0-beta.1"
+git tag -a v1.0.0 -m "v1.0.0"
 git push origin main --tags
 ```
 
@@ -20,29 +21,29 @@ Build and package the Apple Silicon macOS binary:
 
 ```sh
 cargo build --release --target aarch64-apple-darwin
-mkdir -p /tmp/awsp-v0.1.0-beta.9-aarch64-apple-darwin
-install -m 0755 target/aarch64-apple-darwin/release/awsp /tmp/awsp-v0.1.0-beta.9-aarch64-apple-darwin/awsp
-tar -czf /tmp/awsp-v0.1.0-beta.9-aarch64-apple-darwin.tar.gz -C /tmp awsp-v0.1.0-beta.9-aarch64-apple-darwin
-shasum -a 256 /tmp/awsp-v0.1.0-beta.9-aarch64-apple-darwin.tar.gz
-gh release upload v0.1.0-beta.9 /tmp/awsp-v0.1.0-beta.9-aarch64-apple-darwin.tar.gz --repo nomadsre/awsp
+mkdir -p /tmp/awsp-v1.0.0-aarch64-apple-darwin
+install -m 0755 target/aarch64-apple-darwin/release/awsp /tmp/awsp-v1.0.0-aarch64-apple-darwin/awsp
+COPYFILE_DISABLE=1 tar -czf /tmp/awsp-v1.0.0-aarch64-apple-darwin.tar.gz -C /tmp awsp-v1.0.0-aarch64-apple-darwin
+shasum -a 256 /tmp/awsp-v1.0.0-aarch64-apple-darwin.tar.gz
+gh release upload v1.0.0 /tmp/awsp-v1.0.0-aarch64-apple-darwin.tar.gz --repo arseniizakharov/awsp
 ```
 
-Copy `packaging/homebrew/awsp-beta.rb` into the tap repo as:
+Copy `packaging/homebrew/awsp.rb` into the tap repo as:
 
 ```text
-Formula/awsp-beta.rb
+Formula/awsp.rb
 ```
 
-The `v0.1.0-beta.9` Apple Silicon binary checksum is already filled in:
+The `v1.0.0` Apple Silicon binary checksum is:
 
 ```text
-df5df710b57296f070ab261f0a9a12ef18806d91c823d7cf5ca0c40dbf979c1f
+f3d2090ccee044bf734164a067c221053f2aff41db534e6edfd590bcca5cc0d6
 ```
 
 Install from another machine:
 
 ```sh
-brew install nomadsre/awsp/awsp-beta
+brew install arseniizakharov/awsp/awsp
 ```
 
 ## Local Formula Check
@@ -50,8 +51,9 @@ brew install nomadsre/awsp/awsp-beta
 From the tap repo:
 
 ```sh
-brew install ./Formula/awsp-beta.rb
-brew test awsp-beta
+brew install ./Formula/awsp.rb
+brew test awsp
 ```
 
-The beta formula installs a prebuilt Apple Silicon binary on arm64 macOS. Other platforms need their own release artifact before they are added to the formula.
+The formula installs a prebuilt Apple Silicon binary on arm64 macOS. Other
+platforms need their own release artifact before they are added to the formula.

@@ -15,11 +15,27 @@ pub struct State {
     pub last_profile: Option<String>,
     #[serde(default)]
     pub sessions: BTreeMap<String, SessionState>,
+    #[serde(default)]
+    pub team: Option<TeamState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     pub profile: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamState {
+    pub graphql_endpoint: String,
+    pub cognito_domain: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scopes: String,
+    pub idp_identifier: Option<String>,
+    pub id_token: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
     pub updated_at: String,
 }
 
@@ -86,6 +102,24 @@ pub fn clear_session_profile(session_id: &str) -> Result<()> {
 pub fn clear_all() -> Result<()> {
     with_locked_state(|state| {
         *state = State::default();
+        Ok(())
+    })
+}
+
+pub fn get_team_state() -> Result<Option<TeamState>> {
+    Ok(read_state()?.team)
+}
+
+pub fn set_team_state(team: TeamState) -> Result<()> {
+    with_locked_state(|state| {
+        state.team = Some(team.clone());
+        Ok(())
+    })
+}
+
+pub fn clear_team_state() -> Result<()> {
+    with_locked_state(|state| {
+        state.team = None;
         Ok(())
     })
 }
@@ -161,7 +195,23 @@ fn write_state_atomic(path: &Path, state: &State) -> Result<()> {
     temp.persist(path)
         .map(|_| ())
         .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    restrict_state_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_state_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to restrict permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_state_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
