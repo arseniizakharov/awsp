@@ -211,11 +211,7 @@ pub fn team_login(options: TeamLoginOptions) -> Result<()> {
         (_, Some(url)) => extract_authorization_code(url, Some(&state_value))?,
         (None, None) => {
             if options.browser_capture {
-                capture_authorization_code_with_browser(
-                    &authorize_url,
-                    &auth.redirect_uri,
-                    &state_value,
-                )?
+                capture_authorization_code_with_browser(&authorize_url, &state_value)?
             } else if let Some(listener) = callback_listener {
                 wait_for_loopback_code(listener, &state_value)?
             } else {
@@ -1205,7 +1201,6 @@ type CdpSocket = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
 
 fn capture_authorization_code_with_browser(
     authorize_url: &str,
-    redirect_uri: &str,
     expected_state: &str,
 ) -> Result<String> {
     let session = BrowserCaptureSession::launch()?;
@@ -1220,30 +1215,15 @@ fn capture_authorization_code_with_browser(
     cdp_send(
         &mut socket,
         &mut id,
-        "Fetch.enable",
-        json!({
-            "patterns": [{
-                "urlPattern": callback_capture_pattern(redirect_uri),
-                "requestStage": "Request"
-            }]
-        }),
-    )?;
-    cdp_send(
-        &mut socket,
-        &mut id,
         "Page.navigate",
         json!({ "url": authorize_url }),
     )?;
 
     eprintln!("Complete TEAM sign-in in the temporary browser window.");
-    wait_for_browser_captured_code(&mut socket, &mut id, expected_state)
+    wait_for_browser_captured_code(&mut socket, expected_state)
 }
 
-fn wait_for_browser_captured_code(
-    socket: &mut CdpSocket,
-    id: &mut u64,
-    expected_state: &str,
-) -> Result<String> {
+fn wait_for_browser_captured_code(socket: &mut CdpSocket, expected_state: &str) -> Result<String> {
     let deadline = Instant::now() + Duration::from_secs(10 * 60);
     loop {
         if Instant::now() > deadline {
@@ -1270,39 +1250,6 @@ fn wait_for_browser_captured_code(
         };
 
         match method {
-            "Fetch.requestPaused" => {
-                let params = value.get("params").unwrap_or(&Value::Null);
-                let request_id = params
-                    .get("requestId")
-                    .and_then(Value::as_str)
-                    .context("Chrome paused a request without requestId")?;
-                let request_url = params
-                    .get("request")
-                    .and_then(|request| request.get("url"))
-                    .and_then(Value::as_str)
-                    .context("Chrome paused a request without URL")?;
-
-                if query_part(request_url).is_some() {
-                    let code = extract_authorization_code(request_url, Some(expected_state));
-                    cdp_send(
-                        socket,
-                        id,
-                        "Fetch.failRequest",
-                        json!({
-                            "requestId": request_id,
-                            "errorReason": "Aborted"
-                        }),
-                    )?;
-                    return code;
-                }
-
-                cdp_send(
-                    socket,
-                    id,
-                    "Fetch.continueRequest",
-                    json!({ "requestId": request_id }),
-                )?;
-            }
             "Network.requestWillBeSent" | "Page.frameNavigated" => {
                 if let Some(url) = cdp_message_url(&value) {
                     if let Ok(code) = extract_authorization_code(url, Some(expected_state)) {
@@ -1403,15 +1350,6 @@ fn page_websocket_url_from_targets(text: &str) -> Result<Option<String>> {
         .and_then(|target| target.get("webSocketDebuggerUrl"))
         .and_then(Value::as_str)
         .map(str::to_string))
-}
-
-fn callback_capture_pattern(redirect_uri: &str) -> String {
-    let redirect_uri = redirect_uri.trim();
-    if redirect_uri.contains('?') {
-        format!("{redirect_uri}*")
-    } else {
-        format!("{redirect_uri}?*")
-    }
 }
 
 fn find_capture_browser() -> Result<PathBuf> {
@@ -1842,18 +1780,6 @@ mod tests {
         assert_eq!(
             parse_loopback_redirect_uri("https://team.example.com/"),
             None
-        );
-    }
-
-    #[test]
-    fn builds_callback_capture_patterns() {
-        assert_eq!(
-            callback_capture_pattern("https://team.example.com/"),
-            "https://team.example.com/?*"
-        );
-        assert_eq!(
-            callback_capture_pattern("https://team.example.com/callback"),
-            "https://team.example.com/callback?*"
         );
     }
 

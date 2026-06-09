@@ -186,7 +186,7 @@ enum TeamCommand {
         /// Full redirected URL containing code=...
         #[arg(long)]
         redirected_url: Option<String>,
-        /// Capture the Cognito redirect with a temporary Chrome/Chromium window.
+        /// Capture the Cognito redirect from a temporary Chrome/Chromium window.
         #[arg(long, conflicts_with = "no_open")]
         browser_capture: bool,
         /// Print the sign-in URL without trying to open a browser.
