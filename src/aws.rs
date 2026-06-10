@@ -12,8 +12,21 @@ Install AWS CLI v2, for example:
 If AWS CLI is already installed, make sure `aws` is available in PATH and run:
   awsp doctor";
 
+// Profiles are always selected explicitly (--profile/--sso-session/raw
+// credentials). Ambient AWS_PROFILE may point at a profile the user already
+// deleted from ~/.aws/config, and the AWS CLI fails on it even for commands
+// that do not need a profile, so child processes must not inherit it.
+fn aws_command() -> Command {
+    let mut command = Command::new("aws");
+    command
+        .env("AWS_PAGER", "")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_DEFAULT_PROFILE");
+    command
+}
+
 pub fn is_available() -> bool {
-    Command::new("aws")
+    aws_command()
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -51,9 +64,8 @@ pub enum SsoRoleAccess {
 pub fn login_profile(profile: &str, output: AwsOutput) -> Result<()> {
     ensure_available()?;
 
-    let status = Command::new("aws")
+    let status = aws_command()
         .args(["sso", "login", "--profile", profile])
-        .env("AWS_PAGER", "")
         .stdin(Stdio::inherit())
         .stdout(user_stdout(output))
         .stderr(Stdio::inherit())
@@ -70,7 +82,7 @@ pub fn login_profile(profile: &str, output: AwsOutput) -> Result<()> {
 pub fn sso_role_access(profile: &SsoProfile, access_token: &str) -> Result<SsoRoleAccess> {
     ensure_available()?;
 
-    let output = Command::new("aws")
+    let output = aws_command()
         .args([
             "sso",
             "get-role-credentials",
@@ -86,7 +98,6 @@ pub fn sso_role_access(profile: &SsoProfile, access_token: &str) -> Result<SsoRo
             "json",
             "--no-cli-pager",
         ])
-        .env("AWS_PAGER", "")
         .stdin(Stdio::null())
         .output()
         .with_context(|| "failed to run aws sso get-role-credentials")?;
@@ -149,9 +160,8 @@ fn user_stdout(output: AwsOutput) -> Stdio {
 pub fn login_session(session: &str) -> Result<()> {
     ensure_available()?;
 
-    let status = Command::new("aws")
+    let status = aws_command()
         .args(["sso", "login", "--sso-session", session])
-        .env("AWS_PAGER", "")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -168,9 +178,8 @@ pub fn login_session(session: &str) -> Result<()> {
 pub fn logout() -> Result<()> {
     ensure_available()?;
 
-    let status = Command::new("aws")
+    let status = aws_command()
         .args(["sso", "logout"])
-        .env("AWS_PAGER", "")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -213,7 +222,7 @@ pub fn whoami(profile: Option<&str>) -> Result<()> {
 pub fn verify(profile: &str) -> Result<String> {
     ensure_available()?;
 
-    let output = Command::new("aws")
+    let output = aws_command()
         .args([
             "sts",
             "get-caller-identity",
@@ -223,7 +232,6 @@ pub fn verify(profile: &str) -> Result<String> {
             "json",
             "--no-cli-pager",
         ])
-        .env("AWS_PAGER", "")
         .output()
         .with_context(|| "failed to run aws sts get-caller-identity")?;
 
@@ -238,6 +246,82 @@ pub fn verify(profile: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aws_config::{RegionDisplay, SsoProfile};
+    use crate::test_support::{env_lock, EnvGuard};
+
+    fn install_profile_sensitive_aws_mock() -> Result<tempfile::TempDir> {
+        let tempdir = tempfile::tempdir()?;
+        let aws_path = tempdir.path().join("aws");
+        std::fs::write(
+            &aws_path,
+            r#"#!/bin/sh
+if [ -n "$AWS_PROFILE" ] || [ -n "$AWS_DEFAULT_PROFILE" ]; then
+  echo "aws: [ERROR]: The config profile (${AWS_PROFILE:-$AWS_DEFAULT_PROFILE}) could not be found" >&2
+  exit 1
+fi
+exit 0
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&aws_path)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&aws_path, permissions)?;
+        }
+
+        let mut paths = vec![tempdir.path().to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths)?);
+        Ok(tempdir)
+    }
+
+    #[test]
+    fn logout_ignores_deleted_active_profile() -> Result<()> {
+        let _lock = env_lock();
+        let _guard = EnvGuard::capture(&["PATH", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"]);
+        let _mock = install_profile_sensitive_aws_mock()?;
+        std::env::set_var("AWS_PROFILE", "ghost");
+        std::env::set_var("AWS_DEFAULT_PROFILE", "ghost");
+
+        logout()
+    }
+
+    #[test]
+    fn sso_role_access_ignores_deleted_active_profile() -> Result<()> {
+        let _lock = env_lock();
+        let _guard = EnvGuard::capture(&["PATH", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"]);
+        let _mock = install_profile_sensitive_aws_mock()?;
+        std::env::set_var("AWS_PROFILE", "ghost");
+        std::env::set_var("AWS_DEFAULT_PROFILE", "ghost");
+
+        let profile = SsoProfile {
+            name: "mg-tt-prod".to_string(),
+            sso_session: Some("corp".to_string()),
+            sso_start_url: "https://example.awsapps.com/start".to_string(),
+            sso_region: "us-east-1".to_string(),
+            account_id: "111122223333".to_string(),
+            role_name: "Admin".to_string(),
+            region: RegionDisplay::Unset,
+        };
+
+        let access = sso_role_access(&profile, "token")?;
+        assert_eq!(access, SsoRoleAccess::Available);
+        Ok(())
+    }
+
+    #[test]
+    fn login_session_ignores_deleted_active_profile() -> Result<()> {
+        let _lock = env_lock();
+        let _guard = EnvGuard::capture(&["PATH", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"]);
+        let _mock = install_profile_sensitive_aws_mock()?;
+        std::env::set_var("AWS_PROFILE", "ghost");
+        std::env::set_var("AWS_DEFAULT_PROFILE", "ghost");
+
+        login_session("corp")
+    }
 
     #[test]
     fn missing_cli_message_names_dependency_and_fix() {

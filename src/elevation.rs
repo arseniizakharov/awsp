@@ -2165,35 +2165,7 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn capture(keys: &[&'static str]) -> Self {
-            Self {
-                saved: keys
-                    .iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.saved {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
+    use crate::test_support::{env_lock, EnvGuard};
 
     #[test]
     fn decodes_jwt_identity_claims() {
@@ -2367,7 +2339,7 @@ mod tests {
     fn run_request_access_with_team_token(
         token_payload: &[u8],
     ) -> Result<(Result<ElevationOutcome>, String)> {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _env_guard = EnvGuard::capture(&[
             "PATH",
             "AWSP_TEST_GRAPHQL_LOG",

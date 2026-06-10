@@ -12,6 +12,8 @@ mod prompt;
 mod shell;
 mod shell_integration;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use anyhow::{bail, Context, Result};
 use aws_config::SsoInventory;
