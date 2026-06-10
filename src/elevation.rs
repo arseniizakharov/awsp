@@ -879,7 +879,8 @@ impl TeamClient {
         let create_token = self.config.create_token();
         if !token_has_team_router_username(create_token) {
             bail!(
-                "TEAM login token does not expose an IDC_* username claim required by TEAM request workflow. Run `awsp team status` to inspect cached token claims, then use the TEAM UI for this request."
+                "TEAM login token does not expose an IDC_* username claim required by TEAM request workflow. Create token claims: {}. Run `awsp team status` to inspect cached token claims, then use the TEAM UI for this request.",
+                self.config.create_token_claim_summary()
             );
         }
 
@@ -1540,7 +1541,12 @@ fn team_router_username_claim(token: &str) -> Option<String> {
 }
 
 fn is_team_router_username(value: &str) -> bool {
-    value.starts_with("IDC_") && value.len() > 4
+    // The TEAM backend resolves the IDC user from username[4:], ignoring the
+    // prefix case, so lowercase "idc_" (case-insensitive user pools) is valid.
+    value.len() > 4
+        && value
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IDC_"))
 }
 
 fn request_is_enriched_for_team_ui(request: Option<&Value>) -> bool {
@@ -2257,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn create_token_rejects_lowercase_idc_username_for_team_router() {
+    fn create_token_accepts_lowercase_idc_username_for_team_router() {
         let id_payload = base64_url_encode(
             br#"{"email":"user@example.com","cognito:username":"idc_user@example.com","exp":4102444800}"#,
         );
@@ -2267,11 +2273,11 @@ mod tests {
         let access_token = format!("e30.{access_payload}.");
         let config = TeamConfig {
             endpoint: "https://example.appsync-api.us-east-1.amazonaws.com/graphql".to_string(),
-            access_token: access_token.clone(),
-            id_token: Some(id_token),
+            access_token,
+            id_token: Some(id_token.clone()),
         };
 
-        assert_eq!(config.create_token(), access_token);
+        assert_eq!(config.create_token(), id_token);
     }
 
     #[test]
@@ -2288,7 +2294,7 @@ mod tests {
 
         assert!(token_has_team_router_username(&token));
         assert!(!token_has_team_router_username(&wrong_token));
-        assert!(!token_has_team_router_username(&lowercase_token));
+        assert!(token_has_team_router_username(&lowercase_token));
     }
 
     #[test]
@@ -2358,8 +2364,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_access_does_not_call_validate_request_preflight() -> Result<()> {
+    fn run_request_access_with_team_token(
+        token_payload: &[u8],
+    ) -> Result<(Result<ElevationOutcome>, String)> {
         let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _env_guard = EnvGuard::capture(&[
             "PATH",
@@ -2423,12 +2430,7 @@ esac
         std::env::set_var(TEAM_ENDPOINT_ENV, "https://team.example/graphql");
         std::env::set_var(
             TEAM_TOKEN_ENV,
-            format!(
-                "e30.{}.",
-                base64_url_encode(
-                    br#"{"userId":"u-1","groupIds":["requester-group"],"cognito:username":"IDC_user@example.com","exp":4102444800}"#
-                )
-            ),
+            format!("e30.{}.", base64_url_encode(token_payload)),
         );
 
         let profile = SsoProfile {
@@ -2447,21 +2449,65 @@ esac
             yes: true,
         };
 
-        let outcome = request_access(&profile, &options)?;
+        let outcome = request_access(&profile, &options);
+        let log = std::fs::read_to_string(log_path).unwrap_or_default();
+        Ok((outcome, log))
+    }
+
+    #[test]
+    fn request_access_does_not_call_validate_request_preflight() -> Result<()> {
+        let (outcome, log) = run_request_access_with_team_token(
+            br#"{"userId":"u-1","groupIds":["requester-group"],"cognito:username":"IDC_user@example.com","exp":4102444800}"#,
+        )?;
 
         assert_eq!(
-            outcome,
+            outcome?,
             ElevationOutcome::Submitted {
                 id: "req-1".to_string(),
                 status: "pending".to_string()
             }
         );
-        let log = std::fs::read_to_string(log_path)?;
         assert!(log.contains("GetEntitlement"));
         assert!(log.contains("GetApprovers"));
         assert!(log.contains("ListGroups"));
         assert!(log.contains("CreateRequests"));
         assert!(!log.contains("ValidateRequest"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn request_access_submits_with_lowercase_idc_username() -> Result<()> {
+        let (outcome, log) = run_request_access_with_team_token(
+            br#"{"userId":"u-1","groupIds":["requester-group"],"cognito:username":"idc_user@example.com","exp":4102444800}"#,
+        )?;
+
+        assert_eq!(
+            outcome?,
+            ElevationOutcome::Submitted {
+                id: "req-1".to_string(),
+                status: "pending".to_string()
+            }
+        );
+        assert!(log.contains("CreateRequests"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn request_access_preflight_error_includes_create_token_claims() -> Result<()> {
+        let (outcome, log) = run_request_access_with_team_token(
+            br#"{"userId":"u-1","groupIds":["requester-group"],"cognito:username":"user@example.com","exp":4102444800}"#,
+        )?;
+
+        let error = outcome.expect_err("request should fail IDC_* username preflight");
+        let message = format!("{error:#}");
+        assert!(message.contains("IDC_*"), "unexpected error: {message}");
+        assert!(
+            message.contains("Create token claims:"),
+            "unexpected error: {message}"
+        );
+        assert!(!log.contains("CreateRequests"));
 
         Ok(())
     }
